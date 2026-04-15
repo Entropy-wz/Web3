@@ -1,0 +1,52 @@
+# --- Python cache / build ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+pip-wheel-metadata/
+
+# --- Test / type-check / tooling cache ---
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+ENV/
+
+# --- Notebook / local temp ---
+.ipynb_checkpoints/
+*.log
+*.tmp
+*.temp
+
+# --- IDE / OS ---
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# --- Project runtime outputs ---
+artifacts/
+
+# --- Large local datasets / databases (do not upload) ---
+data/**
+!data/.gitkeep
+!data/README.md
+
+# --- SQLite snapshots anywhere ---
+*.sqlite
+*.sqlite3
+*.db
