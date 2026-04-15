@@ -11,7 +11,7 @@ class ActionValidationError(Exception):
 
 
 ECONOMIC_ACTIONS = {"SWAP", "UST_TO_LUNA", "LUNA_TO_UST"}
-SEMANTIC_ACTIONS = {"SPEAK", "VOTE"}
+SEMANTIC_ACTIONS = {"SPEAK", "VOTE", "PROPOSE"}
 
 ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
     "SWAP": {
@@ -43,6 +43,8 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
         "required": ["target", "message"],
         "properties": {
             "target": {"type": "string"},
+            "channel": {"type": "string"},
+            "receiver": {"type": "string"},
             "message": {"type": "string"},
             "mode": {"type": "string", "enum": ["new", "relay", "reply"]},
             "parent_event_id": {"type": "string"},
@@ -53,7 +55,14 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
         "required": ["proposal_id", "decision"],
         "properties": {
             "proposal_id": {"type": "string"},
-            "decision": {"type": "string"},
+            "decision": {"type": "string", "enum": ["approve", "reject", "abstain"]},
+        },
+    },
+    "PROPOSE": {
+        "type": "object",
+        "required": ["proposal_text"],
+        "properties": {
+            "proposal_text": {"type": "string"},
         },
     },
 }
@@ -147,6 +156,8 @@ class SpeakParams(BaseModel):
     model_config = ConfigDict(extra="forbid")
     target: str
     message: str
+    channel: str | None = None
+    receiver: str | None = None
     mode: str = "new"
     parent_event_id: str | None = None
 
@@ -175,10 +186,34 @@ class SpeakParams(BaseModel):
             raise ValueError("parent_event_id cannot be empty")
         return cleaned
 
+    @field_validator("channel")
+    @classmethod
+    def channel_non_empty_if_present(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("channel cannot be empty")
+        return cleaned
+
+    @field_validator("receiver")
+    @classmethod
+    def receiver_non_empty_if_present(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("receiver cannot be empty")
+        return cleaned
+
     @model_validator(mode="after")
     def enforce_parent_for_relay_reply(self) -> "SpeakParams":
         if self.mode in {"relay", "reply"} and not self.parent_event_id:
             raise ValueError("parent_event_id is required when mode is relay/reply")
+        channel_hint = (self.channel or self.target).strip().upper()
+        if channel_hint in {"PRIVATE", "PRIVATE_CHANNEL", "DM", "DIRECT_MESSAGE"}:
+            if not self.receiver:
+                raise ValueError("receiver is required for private-channel speak")
         return self
 
 
@@ -187,12 +222,33 @@ class VoteParams(BaseModel):
     proposal_id: str
     decision: str
 
-    @field_validator("proposal_id", "decision")
+    @field_validator("proposal_id")
     @classmethod
-    def non_empty(cls, value: str) -> str:
+    def proposal_non_empty(cls, value: str) -> str:
         if not value or not value.strip():
-            raise ValueError("proposal_id/decision must be non-empty")
+            raise ValueError("proposal_id must be non-empty")
         return value.strip()
+
+    @field_validator("decision")
+    @classmethod
+    def decision_enum(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"approve", "reject", "abstain"}:
+            raise ValueError("decision must be approve/reject/abstain")
+        return normalized
+
+
+class ProposeParams(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    proposal_text: str
+
+    @field_validator("proposal_text")
+    @classmethod
+    def proposal_text_non_empty(cls, value: str) -> str:
+        text = value.strip()
+        if not text:
+            raise ValueError("proposal_text must be non-empty")
+        return text
 
 
 def normalize_action_type(action_type: str) -> str:
@@ -216,6 +272,8 @@ def validate_action_schema(action_type: str, params: dict[str, Any]) -> dict[str
             validated = LUNAToUSTParams(**params).model_dump()
         elif normalized == "SPEAK":
             validated = SpeakParams(**params).model_dump()
+        elif normalized == "PROPOSE":
+            validated = ProposeParams(**params).model_dump()
         else:
             validated = VoteParams(**params).model_dump()
         return validated

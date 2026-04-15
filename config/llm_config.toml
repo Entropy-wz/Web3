@@ -1,0 +1,37 @@
+﻿# LLM configuration for ACE multi-agent simulation.
+# You can override this path with environment variable ACE_LLM_CONFIG_PATH.
+
+[router]
+max_concurrent = 5
+bucket_capacity = 10
+bucket_refill_rate_per_sec = 5.0
+max_retries = 3
+base_backoff_seconds = 0.25
+jitter_seconds = 0.15
+default_timeout = 20.0
+
+[providers.openai]
+# Recommended: keep api_key empty and provide the key via environment variable.
+api_key = ""
+api_key_env = "OPENAI_API_KEY"
+
+# Put your proxy/gateway URL here if needed, for example:
+# base_url = "https://your-proxy-domain/v1"
+base_url = ""
+
+# Optional fields
+organization = ""
+project = ""
+
+# Role-based model routing
+[roles.whale]
+backend = "openai"
+model = "gpt-4o"
+
+[roles.retail]
+backend = "openai"
+model = "gpt-4o-mini"
+
+[roles.project]
+backend = "openai"
+model = "gpt-4o-mini"

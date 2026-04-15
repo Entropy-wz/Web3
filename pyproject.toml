@@ -13,6 +13,21 @@ dependencies = [
   "networkx>=3.0",
   "numpy>=1.24",
   "matplotlib>=3.7",
+  "tomli>=2.0; python_version < '3.11'",
+]
+
+[project.optional-dependencies]
+llm = [
+  "openai>=1.40.0",
+]
+memory = [
+  "faiss-cpu>=1.8.0",
+  "sentence-transformers>=2.7.0",
+]
+full = [
+  "openai>=1.40.0",
+  "faiss-cpu>=1.8.0",
+  "sentence-transformers>=2.7.0",
 ]
 
 [tool.setuptools]

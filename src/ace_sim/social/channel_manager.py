@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import sqlite3
 from collections import defaultdict
@@ -11,7 +11,7 @@ from uuid import uuid4
 from .network_graph import SocialNetworkGraph
 from .perception_filter import PerceptionFilter
 
-SYSTEM_OVERLOAD_MESSAGE = "[System] 你错过了大量嘈杂的未读消息..."
+SYSTEM_OVERLOAD_MESSAGE = "[System] You missed a large batch of noisy unread messages..."
 
 
 @dataclass
@@ -58,25 +58,37 @@ class ChannelManager:
         if action_type != "SPEAK":
             return []
 
-        target = str(event.params.get("target", "forum")).strip().upper()
-        channel = "SYSTEM_NEWS" if target in {"SYSTEM_NEWS", "SYSTEM", "NEWS"} else "FORUM"
         message = str(event.params["message"])
         sender = str(event.agent_id)
         emit_tick = int(event.emit_tick)
         parent_event_id = event.parent_event_id
-        recipients = self._resolve_recipients(sender, channel)
+
+        channel = self._normalize_channel(event.params)
+        recipients = self._resolve_recipients(sender, channel, event.params)
 
         scheduled: list[QueuedDelivery] = []
-        for receiver in recipients:
+        for receiver, distance in recipients:
             is_cross = self.topology.is_cross_community(sender, receiver)
+            apply_cross_decay = is_cross and channel != "PUBLIC_CHANNEL"
+
             filtered = self.perception_filter.transform(
                 message=message,
                 sender=sender,
                 receiver=receiver,
                 channel=channel,
-                is_cross_community=is_cross,
+                is_cross_community=apply_cross_decay,
                 current_tick=current_tick,
             )
+
+            distance_filtered = self.perception_filter.transmit_info(
+                message=filtered.message,
+                distance=int(distance),
+                channel=channel,
+            )
+
+            combined_delay = int(filtered.delay_ticks) + int(distance_filtered.delay_ticks)
+            combined_tag = self._combine_tags(filtered.transform_tag, distance_filtered.transform_tag)
+
             delivery = QueuedDelivery(
                 delivery_id=str(uuid4()),
                 event_id=str(event.event_id),
@@ -85,10 +97,10 @@ class ChannelManager:
                 receiver=receiver,
                 channel=channel,
                 raw_text=message,
-                perceived_text=filtered.message,
+                perceived_text=distance_filtered.message,
                 emit_tick=emit_tick,
-                deliver_tick=current_tick + int(filtered.delay_ticks),
-                transform_tag=filtered.transform_tag,
+                deliver_tick=current_tick + combined_delay,
+                transform_tag=combined_tag,
             )
             self.pending_deliveries.append(delivery)
             self._write_semantic_delivery_log(delivery)
@@ -184,10 +196,50 @@ class ChannelManager:
         )
         return payload
 
-    def _resolve_recipients(self, sender: str, channel: str) -> list[str]:
+    def _normalize_channel(self, params: dict[str, Any]) -> str:
+        explicit = params.get("channel")
+        if explicit is not None and str(explicit).strip():
+            label = str(explicit).strip().upper()
+        else:
+            label = str(params.get("target", "forum")).strip().upper()
+
+        mapping = {
+            "SYSTEM": "SYSTEM_NEWS",
+            "SYSTEM_NEWS": "SYSTEM_NEWS",
+            "NEWS": "SYSTEM_NEWS",
+            "FORUM": "FORUM",
+            "PUBLIC": "PUBLIC_CHANNEL",
+            "PUBLIC_CHANNEL": "PUBLIC_CHANNEL",
+            "TWITTER": "PUBLIC_CHANNEL",
+            "PRIVATE": "PRIVATE_CHANNEL",
+            "PRIVATE_CHANNEL": "PRIVATE_CHANNEL",
+            "DM": "PRIVATE_CHANNEL",
+            "DIRECT_MESSAGE": "PRIVATE_CHANNEL",
+        }
+        return mapping.get(label, "FORUM")
+
+    def _resolve_recipients(
+        self,
+        sender: str,
+        channel: str,
+        params: dict[str, Any],
+    ) -> list[tuple[str, int]]:
         if channel == "SYSTEM_NEWS":
-            return [agent for agent in self.topology.all_agents() if agent != sender]
-        return [agent for agent in self.topology.listeners_of(sender) if agent != sender]
+            return [(agent, 1) for agent in self.topology.all_agents() if agent != sender]
+
+        if channel == "PRIVATE_CHANNEL":
+            receiver = str(params.get("receiver", "")).strip()
+            if not receiver:
+                return []
+            if receiver == sender:
+                return []
+            distance = self.topology.shortest_distance(sender, receiver)
+            return [(receiver, 1 if distance is None else max(1, int(distance)))]
+
+        if channel == "PUBLIC_CHANNEL":
+            return self.topology.reachable_listeners(sender)
+
+        return [(agent, 1) for agent in self.topology.listeners_of(sender) if agent != sender]
 
     def _delivery_to_message(self, delivery: QueuedDelivery) -> dict[str, Any]:
         return {
@@ -204,7 +256,26 @@ class ChannelManager:
         }
 
     def _channel_weight(self, channel: str) -> int:
-        return 2 if str(channel).upper() == "SYSTEM_NEWS" else 1
+        normalized = str(channel).upper()
+        if normalized == "SYSTEM_NEWS":
+            return 3
+        if normalized == "PRIVATE_CHANNEL":
+            return 2
+        return 1
+
+    def _combine_tags(self, first: str, second: str) -> str:
+        seen: set[str] = set()
+        tags: list[str] = []
+        for tag in [first, second]:
+            if not tag or tag == "none" or tag in seen:
+                continue
+            tags.append(tag)
+            seen.add(tag)
+        if not tags:
+            return "none"
+        if len(tags) == 1:
+            return tags[0]
+        return "+".join(tags)
 
     def _init_tables(self) -> None:
         self._conn.execute(

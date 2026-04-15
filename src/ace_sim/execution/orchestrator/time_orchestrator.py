@@ -27,6 +27,9 @@ from ...engine.ace_engine import (
 from ...social.channel_manager import ChannelManager, QueuedDelivery
 from ...social.network_graph import SocialNetworkGraph
 from ...social.perception_filter import PerceptionFilter
+from ...governance.governance import GovernanceModule
+from ...governance.logger_metrics import LoggerMetrics
+from ...governance.state_checkpoint import StateCheckpoint
 from ..guardrails.secretary_auditor import InsufficientBalanceError, SecretaryAuditor
 
 
@@ -61,6 +64,7 @@ class TxReceipt:
     status: str
     action_type: str
     agent_id: str
+    gas_bid: Decimal = Decimal("0")
     gas_token: str | None = None
     gas_paid: Decimal = Decimal("0")
     error_code: str | None = None
@@ -75,6 +79,10 @@ class TickSettlementReport:
     end_snapshot: dict[str, Any]
     fee_vault_snapshot: dict[str, Decimal]
     semantic_deliveries: list[dict[str, Any]] = field(default_factory=list)
+    governance_settlements: list[Any] = field(default_factory=list)
+    governance_applied_updates: list[Any] = field(default_factory=list)
+    mempool_processed: int = 0
+    mempool_congestion: int = 0
 
 
 class Simulation_Orchestrator:
@@ -88,13 +96,24 @@ class Simulation_Orchestrator:
         topology: SocialNetworkGraph | None = None,
         perception_filter: PerceptionFilter | None = None,
         channel_manager: ChannelManager | None = None,
+        governance: GovernanceModule | None = None,
+        max_tx_per_tick: int = 50,
+        default_max_inbox_size: int = 5,
+        metrics_logger: LoggerMetrics | None = None,
+        state_checkpoint: StateCheckpoint | None = None,
     ) -> None:
         if ticks_per_day <= 0:
             raise ValueError("ticks_per_day must be > 0")
+        if max_tx_per_tick <= 0:
+            raise ValueError("max_tx_per_tick must be > 0")
+        if default_max_inbox_size <= 0:
+            raise ValueError("default_max_inbox_size must be > 0")
 
         self.engine = engine
         self.current_tick: int = 0
         self.ticks_per_day: int = int(ticks_per_day)
+        self.max_tx_per_tick: int = int(max_tx_per_tick)
+        self.default_max_inbox_size: int = int(default_max_inbox_size)
         self.engine.set_simulation_clock(self.current_tick, self.ticks_per_day)
 
         self.mempool: list[Transaction] = []
@@ -108,6 +127,9 @@ class Simulation_Orchestrator:
         self.tick_history: dict[int, TickSettlementReport] = {}
         self.halted: bool = False
         self.secretary = secretary or SecretaryAuditor()
+        self.governance = governance or GovernanceModule(db_path=self.engine.get_db_path())
+        self.metrics_logger = metrics_logger
+        self.state_checkpoint = state_checkpoint
         self._event_subscribers: list[Callable[[SemanticEvent], None]] = []
 
         if channel_manager is not None:
@@ -130,6 +152,7 @@ class Simulation_Orchestrator:
 
     def close(self) -> None:
         self.channel_manager.close()
+        self.governance.close()
         if getattr(self, "_aux_conn", None) is not None:
             self._aux_conn.close()
             self._aux_conn = None
@@ -165,6 +188,21 @@ class Simulation_Orchestrator:
             )
         validated_params = validate_action_schema(normalized_action, params)
 
+        if normalized_action == "PROPOSE":
+            return self.governance.submit_proposal(
+                proposer=agent_id,
+                proposal_text=validated_params["proposal_text"],
+                current_tick=self.current_tick,
+                engine=self.engine,
+            )
+        if normalized_action == "VOTE":
+            return self.governance.submit_vote(
+                voter=agent_id,
+                proposal_id=validated_params["proposal_id"],
+                decision=validated_params["decision"],
+                current_tick=self.current_tick,
+            )
+
         event = SemanticEvent(
             event_id=str(uuid4()),
             agent_id=agent_id,
@@ -195,12 +233,46 @@ class Simulation_Orchestrator:
             handled += 1
         return processed
 
-    def read_inbox(self, agent_id: str, max_inbox_size: int = 5) -> list[dict[str, Any]]:
+    def read_inbox(
+        self, agent_id: str, max_inbox_size: int | None = None
+    ) -> list[dict[str, Any]]:
+        limit = self.default_max_inbox_size if max_inbox_size is None else int(max_inbox_size)
         return self.channel_manager.read_inbox(
             agent_id=agent_id,
             current_tick=self.current_tick,
-            max_inbox_size=max_inbox_size,
+            max_inbox_size=limit,
         )
+
+    def get_public_state(self) -> dict[str, Any]:
+        snapshot = self.engine.get_state_snapshot()
+        pools = snapshot.get("pools", {})
+        governance_state = self.governance.get_state()
+        return {
+            "tick": int(self.current_tick),
+            "oracle_price_usdc_per_luna": snapshot.get("oracle_price_usdc_per_luna"),
+            "Pool_A": pools.get("Pool_A"),
+            "Pool_B": pools.get("Pool_B"),
+            "protocol_fee_vault": {
+                token: str(amount) for token, amount in self.protocol_fee_vault.items()
+            },
+            "governance": {
+                "open_proposals": governance_state.get("open_proposals", 0),
+                "parameter_version": governance_state.get("parameter_version", 0),
+            },
+        }
+
+    def set_ticks_per_day(self, ticks_per_day: int) -> None:
+        value = int(ticks_per_day)
+        if value <= 0:
+            raise ValueError("ticks_per_day must be > 0")
+        self.ticks_per_day = value
+        self.engine.set_simulation_clock(self.current_tick, self.ticks_per_day)
+
+    def set_default_max_inbox_size(self, max_inbox_size: int) -> None:
+        value = int(max_inbox_size)
+        if value <= 0:
+            raise ValueError("max_inbox_size must be > 0")
+        self.default_max_inbox_size = value
 
     def log_agent_thought(
         self,
@@ -291,14 +363,23 @@ class Simulation_Orchestrator:
             raise RuntimeError("orchestrator halted due to fatal invariant violation")
 
         self.current_tick += 1
+        governance_applied_updates = self.governance.apply_due_updates(
+            current_tick=self.current_tick,
+            engine=self.engine,
+            orchestrator=self,
+        )
         self.engine.set_simulation_clock(self.current_tick, self.ticks_per_day)
 
         # Drain semantic bus first, then deliver only due messages for current tick.
         self.process_fast_events()
         semantic_due = self.channel_manager.deliver_due(current_tick=self.current_tick)
 
-        batch = self._drain_mempool()
-        batch.sort(key=lambda tx: (-tx.gas_price, tx.enqueue_seq))
+        batch_all = self._drain_mempool()
+        batch_all.sort(key=lambda tx: (-tx.gas_price, tx.enqueue_seq))
+        batch = batch_all[: self.max_tx_per_tick]
+        leftovers = batch_all[self.max_tx_per_tick :]
+        if leftovers:
+            self.mempool.extend(leftovers)
 
         receipts: list[TxReceipt] = []
         for rank, tx in enumerate(batch):
@@ -327,6 +408,7 @@ class Simulation_Orchestrator:
                         status="success",
                         action_type=tx.action_type,
                         agent_id=tx.agent_id,
+                        gas_bid=tx.gas_price,
                         gas_token=gas_token,
                         gas_paid=gas_paid,
                         result=result,
@@ -341,6 +423,7 @@ class Simulation_Orchestrator:
                         status="failed",
                         action_type=tx.action_type,
                         agent_id=tx.agent_id,
+                        gas_bid=tx.gas_price,
                         gas_token=gas_token,
                         gas_paid=gas_paid,
                         error_code="SlippageExceededError",
@@ -363,6 +446,7 @@ class Simulation_Orchestrator:
                         status="failed",
                         action_type=tx.action_type,
                         agent_id=tx.agent_id,
+                        gas_bid=tx.gas_price,
                         gas_token=gas_token,
                         gas_paid=gas_paid,
                         error_code=type(exc).__name__,
@@ -379,6 +463,7 @@ class Simulation_Orchestrator:
                         status="fatal",
                         action_type=tx.action_type,
                         agent_id=tx.agent_id,
+                        gas_bid=tx.gas_price,
                         gas_token=gas_token,
                         gas_paid=gas_paid,
                         error_code="InvariantViolationError",
@@ -388,6 +473,7 @@ class Simulation_Orchestrator:
                 self.halted = True
                 break
 
+        governance_settlements = self.governance.settle_due(current_tick=self.current_tick)
         end_snapshot = self.engine.get_state_snapshot()
         report = TickSettlementReport(
             tick=self.current_tick,
@@ -395,7 +481,17 @@ class Simulation_Orchestrator:
             end_snapshot=end_snapshot,
             fee_vault_snapshot={k: Decimal(v) for k, v in self.protocol_fee_vault.items()},
             semantic_deliveries=[self._delivery_to_dict(item) for item in semantic_due],
+            governance_settlements=governance_settlements,
+            governance_applied_updates=governance_applied_updates,
+            mempool_processed=len(batch),
+            mempool_congestion=len(self.mempool),
         )
+
+        if self.metrics_logger is not None:
+            self.metrics_logger.record_tick(orchestrator=self, report=report)
+        if self.state_checkpoint is not None:
+            self.state_checkpoint.save_tick(orchestrator=self, report=report)
+
         self.tick_history[self.current_tick] = report
         return report
 
@@ -429,6 +525,8 @@ class Simulation_Orchestrator:
             "channel": delivery.channel,
             "emit_tick": delivery.emit_tick,
             "deliver_tick": delivery.deliver_tick,
+            "raw_text": delivery.raw_text,
+            "perceived_text": delivery.perceived_text,
             "transform_tag": delivery.transform_tag,
         }
 

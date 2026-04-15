@@ -47,8 +47,8 @@ def submit_tick_workload(orchestrator: Simulation_Orchestrator, tick_idx: int, n
     if tick_idx % 7 == 0:
         orchestrator.submit_event(
             agent_id=speaker,
-            action_type="VOTE",
-            params={"proposal_id": f"p-{tick_idx//7}", "decision": "approve"},
+            action_type="SPEAK",
+            params={"target": "forum", "message": f"governance sentiment tick-{tick_idx}"},
         )
 
     # Deterministic MEV pair:

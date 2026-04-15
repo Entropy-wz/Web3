@@ -23,9 +23,9 @@ class UnauthorizedActionError(Exception):
 
 
 ROLE_ACTION_MATRIX: dict[str, set[str]] = {
-    "retail": {"SWAP", "UST_TO_LUNA", "LUNA_TO_UST", "SPEAK", "VOTE"},
-    "whale": {"SWAP", "UST_TO_LUNA", "LUNA_TO_UST", "SPEAK", "VOTE"},
-    "project": {"SWAP", "UST_TO_LUNA", "LUNA_TO_UST", "SPEAK", "VOTE"},
+    "retail": {"SWAP", "UST_TO_LUNA", "LUNA_TO_UST", "SPEAK", "VOTE", "PROPOSE"},
+    "whale": {"SWAP", "UST_TO_LUNA", "LUNA_TO_UST", "SPEAK", "VOTE", "PROPOSE"},
+    "project": {"SWAP", "UST_TO_LUNA", "LUNA_TO_UST", "SPEAK", "VOTE", "PROPOSE"},
 }
 
 

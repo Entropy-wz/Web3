@@ -45,6 +45,32 @@ class SocialNetworkGraph:
             return []
         return sorted(self.graph.successors(sender_id))
 
+    def reachable_listeners(self, sender: str, max_distance: int | None = None) -> list[tuple[str, int]]:
+        sender_id = str(sender).strip()
+        if sender_id not in self.graph:
+            return []
+
+        lengths = nx.single_source_shortest_path_length(self.graph, sender_id)
+        out: list[tuple[str, int]] = []
+        for node, dist in lengths.items():
+            if node == sender_id:
+                continue
+            if max_distance is not None and dist > max_distance:
+                continue
+            out.append((str(node), int(dist)))
+        out.sort(key=lambda item: (item[1], item[0]))
+        return out
+
+    def shortest_distance(self, sender: str, receiver: str) -> int | None:
+        sender_id = str(sender).strip()
+        receiver_id = str(receiver).strip()
+        if sender_id not in self.graph or receiver_id not in self.graph:
+            return None
+        try:
+            return int(nx.shortest_path_length(self.graph, sender_id, receiver_id))
+        except nx.NetworkXNoPath:
+            return None
+
     def all_agents(self) -> list[str]:
         return sorted(self.graph.nodes())
 
@@ -83,19 +109,16 @@ class SocialNetworkGraph:
             retails = [a for a in members if self.graph.nodes[a]["role"] == "retail"]
             anchors = projects + whales
 
-            # Project nodes can broadcast to everyone in their community.
             for project in projects:
                 for member in members:
                     if member != project:
                         self.connect(project, member)
 
-            # Whales observe/broadcast to key neighbors.
             for whale in whales:
                 targets = [m for m in members if m != whale]
                 for target in rng.sample(targets, k=min(6, len(targets))):
                     self.connect(whale, target)
 
-            # Retail nodes mainly circulate locally, plus one anchor link.
             for retail in retails:
                 local_retail_targets = [r for r in retails if r != retail]
                 for target in rng.sample(
@@ -105,7 +128,6 @@ class SocialNetworkGraph:
                 if anchors:
                     self.connect(retail, rng.choice(anchors))
 
-        # Sparse cross-community bridges (mostly whales/projects).
         leaders = [
             n
             for n in self.graph.nodes()
@@ -124,10 +146,43 @@ class SocialNetworkGraph:
             ):
                 self.connect(leader, target)
 
-        # Ensure every node has at least one outgoing listener if possible.
+        self._ensure_non_isolated(seed=seed + 17)
+
+    def build_scale_free_topology(self, seed: int = 42, m: int = 2) -> None:
+        """Build a directed scale-free style topology from existing registered agents."""
+        agents = self.all_agents()
+        n = len(agents)
+        if n <= 1:
+            return
+
+        m = max(1, min(int(m), n - 1))
+        rng = random.Random(seed)
+        self.graph.remove_edges_from(list(self.graph.edges()))
+
+        undirected = nx.barabasi_albert_graph(n=n, m=m, seed=seed)
+        idx_to_agent = {idx: agent for idx, agent in enumerate(agents)}
+
+        for u_idx, v_idx in undirected.edges():
+            u = idx_to_agent[int(u_idx)]
+            v = idx_to_agent[int(v_idx)]
+            if rng.random() < 0.5:
+                self.connect(u, v)
+                if rng.random() < 0.25:
+                    self.connect(v, u)
+            else:
+                self.connect(v, u)
+                if rng.random() < 0.25:
+                    self.connect(u, v)
+
+        self._ensure_non_isolated(seed=seed + 31)
+
+    def _ensure_non_isolated(self, seed: int) -> None:
+        rng = random.Random(seed)
         all_agents = self.all_agents()
+        if len(all_agents) <= 1:
+            return
         for agent in all_agents:
-            if self.graph.out_degree(agent) == 0 and len(all_agents) > 1:
+            if self.graph.out_degree(agent) == 0:
                 fallback = rng.choice([a for a in all_agents if a != agent])
                 self.connect(agent, fallback)
 

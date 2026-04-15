@@ -50,3 +50,10 @@ data/**
 *.sqlite
 *.sqlite3
 *.db
+
+# --- Local LLM secret overrides ---
+config/llm_config.local.toml
+config/*.local.toml
+*.local.env
+.env
+.env.*

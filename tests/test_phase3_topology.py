@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import sqlite3
 from decimal import Decimal
@@ -35,7 +35,7 @@ def test_inbox_overload_inserts_system_notice(tmp_path):
     inbox = orchestrator.read_inbox("target", max_inbox_size=5)
     assert len(inbox) == 5
     assert any(msg["is_overload_notice"] for msg in inbox)
-    assert any("你错过了大量嘈杂的未读消息" in msg["message"] for msg in inbox)
+    assert any("missed a large batch" in msg["message"] for msg in inbox)
 
     conn = sqlite3.connect(engine.get_db_path())
     row = conn.execute(
@@ -142,8 +142,8 @@ def test_cross_community_message_has_decay_and_delay(tmp_path):
 
     inbox = orchestrator.read_inbox("receiver")
     assert len(inbox) == 1
-    assert "[价格暴跌]" in inbox[0]["message"]
-    assert inbox[0]["transform_tag"] == "rule"
+    assert "[PRICE_SHOCK]" in inbox[0]["message"]
+    assert "rule" in inbox[0]["transform_tag"]
 
 
 def test_prefix_probability_is_close_to_30_percent_under_fixed_seed():
@@ -159,7 +159,7 @@ def test_prefix_probability_is_close_to_30_percent_under_fixed_seed():
             is_cross_community=True,
             current_tick=0,
         )
-        if out.message.startswith("[据传]") or out.message.startswith("[恐慌]"):
+        if out.message.startswith("[RUMOR]") or out.message.startswith("[PANIC]"):
             prefixed += 1
     ratio = prefixed / total
     assert 0.25 <= ratio <= 0.35

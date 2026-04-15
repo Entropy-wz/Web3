@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import sqlite3
 
@@ -25,8 +25,8 @@ def test_agent_execute_action_logs_thought_and_hides_it_from_broadcast(tmp_path)
 
     def mock_llm(_prompt: str):
         return {
-            "thought": "这条是内部推理，不应广播。",
-            "speak": {"target": "forum", "message": "大家小心波动。", "mode": "new"},
+            "thought": "internal reasoning should not be broadcast",
+            "speak": {"target": "forum", "message": "watch volatility", "mode": "new"},
             "action": None,
         }
 
@@ -36,8 +36,8 @@ def test_agent_execute_action_logs_thought_and_hides_it_from_broadcast(tmp_path)
     assert len(result["event_ids"]) == 1
     bob_inbox = orchestrator.read_inbox("bob")
     assert len(bob_inbox) == 1
-    assert "内部推理" not in bob_inbox[0]["message"]
-    assert "大家小心波动" in bob_inbox[0]["message"]
+    assert "internal reasoning" not in bob_inbox[0]["message"]
+    assert "watch volatility" in bob_inbox[0]["message"]
 
     conn = sqlite3.connect(orchestrator.engine.get_db_path())
     row = conn.execute(
@@ -50,7 +50,7 @@ def test_agent_execute_action_logs_thought_and_hides_it_from_broadcast(tmp_path)
     ).fetchone()
     conn.close()
     assert row is not None
-    assert row[0] == "这条是内部推理，不应广播。"
+    assert row[0] == "internal reasoning should not be broadcast"
     assert row[1] == "success"
 
 
@@ -61,7 +61,7 @@ def test_agent_role_permission_guardrail_blocks_forbidden_action(tmp_path):
 
     def mock_llm(_prompt: str):
         return {
-            "thought": "尝试执行越权动作。",
+            "thought": "attempting unauthorized action",
             "speak": None,
             "action": {
                 "action_type": "SWAP",
@@ -75,7 +75,6 @@ def test_agent_role_permission_guardrail_blocks_forbidden_action(tmp_path):
             },
         }
 
-    # Force a role not in the matrix to trigger strict guardrail.
     bad_agent = RetailAgent(agent_id="alice", community_id="c1", llm_callable=mock_llm)
     bad_agent.role = "outsider"
 

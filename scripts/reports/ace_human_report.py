@@ -8,6 +8,9 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
+DECIMAL_ABS_TOL = Decimal("1e-18")
+DECIMAL_REL_TOL = Decimal("1e-18")
+
 
 @dataclass
 class LedgerRow:
@@ -98,6 +101,7 @@ def plus_num(x: Decimal, places: int = 6) -> str:
 def summarize_invariant(snapshot: dict[str, Any]) -> tuple[bool, dict[str, Decimal]]:
     accounts = snapshot["accounts"]
     pools = snapshot["pools"]
+    fee_vault = snapshot.get("fee_vault", {})
     counters = {k: to_decimal(v) for k, v in snapshot["counters"].items()}
     genesis = {k: to_decimal(v) for k, v in snapshot["genesis_totals"].items()}
 
@@ -112,12 +116,19 @@ def summarize_invariant(snapshot: dict[str, Any]) -> tuple[bool, dict[str, Decim
         + to_decimal(pools["Pool_A"]["reserve_y"])
         + to_decimal(pools["Pool_B"]["reserve_y"])
     )
+    total_ust += to_decimal(fee_vault.get("UST", "0"))
+    total_luna += to_decimal(fee_vault.get("LUNA", "0"))
+    total_usdc += to_decimal(fee_vault.get("USDC", "0"))
 
     expected_ust = genesis["UST"] + counters["total_ust_minted"] - counters["total_ust_burned_for_luna"]
     expected_luna = genesis["LUNA"] + counters["total_luna_minted"] - counters["total_luna_burned_for_ust"]
     expected_usdc = genesis["USDC"]
 
-    ok = (total_ust == expected_ust) and (total_luna == expected_luna) and (total_usdc == expected_usdc)
+    ok = (
+        close_enough(total_ust, expected_ust)
+        and close_enough(total_luna, expected_luna)
+        and close_enough(total_usdc, expected_usdc)
+    )
     return ok, {
         "total_ust": total_ust,
         "expected_ust": expected_ust,
@@ -126,6 +137,13 @@ def summarize_invariant(snapshot: dict[str, Any]) -> tuple[bool, dict[str, Decim
         "total_usdc": total_usdc,
         "expected_usdc": expected_usdc,
     }
+
+
+def close_enough(left: Decimal, right: Decimal) -> bool:
+    diff = abs(left - right)
+    scale = max(abs(left), abs(right), Decimal("1"))
+    threshold = max(DECIMAL_ABS_TOL, DECIMAL_REL_TOL * scale)
+    return diff <= threshold
 
 
 def print_timeline(rows: list[LedgerRow]) -> None:
