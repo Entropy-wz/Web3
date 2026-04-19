@@ -31,7 +31,7 @@ from ace_sim.config.llm_config import load_llm_config
 from ace_sim.engine.ace_engine import ACE_Engine
 from ace_sim.execution.orchestrator.time_orchestrator import TickSettlementReport
 from ace_sim.execution.orchestrator.time_orchestrator import Simulation_Orchestrator
-from ace_sim.governance.governance import GovernanceModule
+from ace_sim.governance.governance import GovernanceModule, ProposalLimitError
 from ace_sim.governance.logger_metrics import LoggerMetrics
 from ace_sim.governance.state_checkpoint import StateCheckpoint
 from ace_sim.runtime.agent_runtime import AgentRuntime
@@ -55,6 +55,11 @@ SCENARIO_CHOICES = ("default", SCENARIO_DEFAULT)
 KEY_TICKS_FOR_QUALITY = (1, 3, 6, 10, 20, 50)
 EARLY_NEAR_ZERO_TICK = 15
 EARLY_NEAR_ZERO_PRICE = Decimal("0.01")
+DOS_PLACEHOLDER_PROPOSALS = (
+    "Update protocol logo style guidelines for social media banners.",
+    "Allocate a symbolic community meme budget with no economic impact.",
+    "Start a low-priority ecosystem slogan contest without parameter changes.",
+)
 
 
 def _parse_positive_decimal(raw: Any, *, field_name: str) -> Decimal:
@@ -489,16 +494,29 @@ def _contains_panic(text: str) -> bool:
     return any(term in lower for term in PANIC_TERMS)
 
 
-def _count_overload_people(conn: sqlite3.Connection, tick: int) -> int:
+def _count_overload_people_by_read_tick(conn: sqlite3.Connection, read_tick: int) -> int:
     row = conn.execute(
         """
         SELECT COUNT(*)
         FROM inbox_overload_log
         WHERE tick = ? AND dropped_count > 0
         """,
-        (int(tick),),
+        (int(read_tick),),
     ).fetchone()
     return int(row[0]) if row else 0
+
+
+def _read_tick_for_settlement_tick(settlement_tick: int) -> int:
+    # Inbox overload is logged during agent cognition before step_tick increments time.
+    # So the overload row for settlement tick T is recorded at read tick T-1.
+    return max(0, int(settlement_tick) - 1)
+
+
+def _count_overload_people_for_settlement_tick(
+    conn: sqlite3.Connection, settlement_tick: int
+) -> int:
+    read_tick = _read_tick_for_settlement_tick(settlement_tick)
+    return _count_overload_people_by_read_tick(conn, read_tick)
 
 
 def _log_retail_swap_summary(
@@ -644,6 +662,9 @@ def simulate(
     progress_interval: int,
     offline_rules: bool,
     black_swan_schedule: dict[int, list[dict[str, Any]]] | None = None,
+    governance_dos_attack: bool = False,
+    dos_attacker_id: str = "whale_1",
+    dos_sell_ust: Decimal = Decimal("300000"),
 ) -> dict[str, Any]:
     retail_agents = [name for name in agents if role_of(name, role_map) == "retail"]
     if not retail_agents:
@@ -653,6 +674,16 @@ def simulate(
     llm_calls_total = 0
     sleeping_total = 0
     ust_price_by_tick: dict[int, Decimal] = {}
+    dos_stats: dict[str, Any] = {
+        "enabled": bool(governance_dos_attack),
+        "attacker_id": dos_attacker_id,
+        "placeholder_submitted": 0,
+        "placeholder_rejected": 0,
+        "placeholder_ids": [],
+        "project_proposal_rejected": False,
+        "project_reject_reason": None,
+        "project_proposal_id": None,
+    }
 
     conn = sqlite3.connect(orchestrator.engine.get_db_path())
     try:
@@ -673,15 +704,73 @@ def simulate(
                         action["params"],
                     )
 
-            # Governance stream
-            if tick == 1:
-                proposal_id = orchestrator.submit_event(
-                    "project_0",
-                    "PROPOSE",
+            if governance_dos_attack and tick == 0:
+                orchestrator.submit_transaction(
+                    dos_attacker_id,
+                    "SWAP",
                     {
-                        "proposal_text": "Disable minting and set swap fee to 0.01",
+                        "pool_name": "Pool_A",
+                        "token_in": "UST",
+                        "amount": str(dos_sell_ust),
+                        "slippage_tolerance": "0.50",
+                    },
+                    gas_price="995",
+                )
+                orchestrator.submit_event(
+                    dos_attacker_id,
+                    "SPEAK",
+                    {
+                        "target": "forum",
+                        "message": "Governance is too slow. Panic first, rules later.",
+                        "mode": "new",
                     },
                 )
+                for idx, text in enumerate(DOS_PLACEHOLDER_PROPOSALS, start=1):
+                    try:
+                        placeholder_id = orchestrator.submit_event(
+                            dos_attacker_id,
+                            "PROPOSE",
+                            {"proposal_text": text},
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        dos_stats["placeholder_rejected"] = int(
+                            dos_stats["placeholder_rejected"]
+                        ) + 1
+                        logger.info(
+                            "[GOV-DOS] attacker placeholder proposal %d rejected | reason=%s",
+                            idx,
+                            str(exc),
+                        )
+                    else:
+                        dos_stats["placeholder_submitted"] = int(
+                            dos_stats["placeholder_submitted"]
+                        ) + 1
+                        dos_stats["placeholder_ids"].append(placeholder_id)
+                        logger.info(
+                            "[GOV-DOS] attacker placeholder proposal %d accepted | proposal=%s",
+                            idx,
+                            str(placeholder_id),
+                        )
+
+            # Governance stream
+            if tick == 1:
+                try:
+                    proposal_id = orchestrator.submit_event(
+                        "project_0",
+                        "PROPOSE",
+                        {
+                            "proposal_text": "Disable minting and set swap fee to 0.01",
+                        },
+                    )
+                    dos_stats["project_proposal_id"] = proposal_id
+                except ProposalLimitError as exc:
+                    proposal_id = None
+                    dos_stats["project_proposal_rejected"] = True
+                    dos_stats["project_reject_reason"] = str(exc)
+                    logger.info(
+                        "[GOV-DOS] project rescue proposal rejected by concurrency cap | reason=%s",
+                        str(exc),
+                    )
             if tick == 2 and proposal_id:
                 voters = ["whale_0", "whale_1", "project_0"] + retail_agents[:2]
                 reject_voter = voters[-1] if len(voters) >= 4 else None
@@ -775,7 +864,7 @@ def simulate(
                 if str(item.get("transform_tag", "none")) != "none"
                 or _contains_panic(str(item.get("perceived_text", "")))
             )
-            overload_people = _count_overload_people(conn, report.tick)
+            overload_people = _count_overload_people_for_settlement_tick(conn, report.tick)
             logger.info(
                 "[SOCIAL] 产生流言: %d | 触发认知过载: %d 人次",
                 int(rumor_count),
@@ -794,6 +883,7 @@ def simulate(
         "sleeping_total": sleeping_total,
         "ticks": ticks,
         "ust_price_by_tick": ust_price_by_tick,
+        "governance_dos": dos_stats,
     }
 
 
@@ -970,6 +1060,23 @@ def parse_args() -> argparse.Namespace:
         help="Retail total UST cap for staircase scenario.",
     )
     parser.add_argument(
+        "--governance-dos-attack",
+        action="store_true",
+        help="Enable Governance-DoS script: whale_1 submits 3 placeholder proposals to occupy slots.",
+    )
+    parser.add_argument(
+        "--dos-whale-luna",
+        type=str,
+        default="4000",
+        help="Initial LUNA assigned to whale_1 when governance DoS mode is enabled.",
+    )
+    parser.add_argument(
+        "--dos-sell-ust",
+        type=str,
+        default="300000",
+        help="Whale_1 UST sell amount during Governance-DoS trigger tick.",
+    )
+    parser.add_argument(
         "--no-paper-charts",
         action="store_true",
         help="Disable automatic paper-grade chart generation after simulation.",
@@ -1051,6 +1158,8 @@ def main() -> None:
     shock_t3 = _parse_positive_decimal(args.shock_t3, field_name="shock_t3")
     shock_t6 = _parse_positive_decimal(args.shock_t6, field_name="shock_t6")
     retail_ust_cap = _parse_positive_decimal(args.retail_ust_cap, field_name="retail_ust_cap")
+    dos_whale_luna = _parse_positive_decimal(args.dos_whale_luna, field_name="dos_whale_luna")
+    dos_sell_ust = _parse_positive_decimal(args.dos_sell_ust, field_name="dos_sell_ust")
     pool_a_reserves = _parse_pool_reserves(args.pool_a_init)
     if args.scenario == SCENARIO_DEFAULT:
         pool_b_reserves = pool_a_reserves
@@ -1101,6 +1210,10 @@ def main() -> None:
     logger.info("[CONFIG] ticks_per_day=%d", int(args.ticks_per_day))
     logger.info("[CONFIG] voting_window_ticks=%d", int(args.voting_window_ticks))
     logger.info(
+        "[CONFIG] governance_dos_attack=%s",
+        "on" if args.governance_dos_attack else "off",
+    )
+    logger.info(
         "[CONFIG] pool_a_init=(%s,%s) | pool_b_init=(%s,%s)",
         str(pool_a_reserves[0]),
         str(pool_a_reserves[1]),
@@ -1121,9 +1234,11 @@ def main() -> None:
     )
     metrics = LoggerMetrics(metrics_csv)
     checkpoints = StateCheckpoint(checkpoint_dir)
+    governance_max_open_per_agent = 3 if args.governance_dos_attack else 1
     governance = GovernanceModule(
         db_path=db_path,
         voting_window_ticks=int(args.voting_window_ticks),
+        max_open_per_agent=governance_max_open_per_agent,
     )
 
     orchestrator = Simulation_Orchestrator(
@@ -1148,6 +1263,18 @@ def main() -> None:
             bootstrap=bootstrap,
             cap=retail_ust_cap,
             logger=logger,
+        )
+    if args.governance_dos_attack:
+        for item in bootstrap:
+            if item.agent_id == "whale_1":
+                if item.initial_luna < dos_whale_luna:
+                    item.initial_luna = dos_whale_luna
+                break
+        logger.info(
+            "[CONFIG] governance_dos_attack enabled | whale_1_initial_luna=%s | dos_sell_ust=%s | max_open_per_agent=%d",
+            str(dos_whale_luna),
+            str(dos_sell_ust),
+            int(governance_max_open_per_agent),
         )
     bootstrap_by_id = {item.agent_id: item for item in bootstrap}
     role_map = {item.agent_id: item.role for item in bootstrap}
@@ -1195,6 +1322,9 @@ def main() -> None:
             progress_interval=int(args.progress_interval),
             offline_rules=args.offline_rules,
             black_swan_schedule=black_swan_schedule,
+            governance_dos_attack=bool(args.governance_dos_attack),
+            dos_attacker_id="whale_1",
+            dos_sell_ust=dos_sell_ust,
         )
 
         curve_quality = _evaluate_curve_quality(
@@ -1225,6 +1355,7 @@ def main() -> None:
             },
             "retail_ust_cap": retail_cap_info,
             "curve_quality": curve_quality,
+            "governance_dos": sim_stats.get("governance_dos", {}),
             "db": str(db_path),
             "metrics_csv": str(metrics_csv),
             "checkpoint_count": len(list(checkpoint_dir.glob("tick_*.json"))),

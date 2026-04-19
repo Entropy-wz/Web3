@@ -55,6 +55,20 @@ def test_luna_crash_bootstrap_key_allocations():
     assert str(by_id["whale_1"].initial_usdc) == "50000000"
 
 
+def test_whale_1_profile_contains_governance_dos_intent():
+    cohort = build_luna_crash_bootstrap(retail_count=21)
+    by_id = {item.agent_id: item for item in cohort}
+    whale_1 = by_id["whale_1"].profile
+
+    policy = str(whale_1.governance_policy).lower()
+    strategy = str(whale_1.strategy_prompt).lower()
+    goals = " ".join(str(g).lower() for g in whale_1.hidden_goals)
+
+    assert "placeholder" in policy
+    assert "jam governance" in strategy
+    assert "occupying governance proposal slots" in goals
+
+
 def test_black_swan_tick0_actions_shape():
     actions = default_black_swan_tick0_actions()
     assert len(actions) == 2

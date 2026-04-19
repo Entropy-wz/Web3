@@ -60,3 +60,6 @@ config/*.local.toml
 *.local.env
 .env
 .env.*
+
+# --- Paper working outputs ---
+paper/

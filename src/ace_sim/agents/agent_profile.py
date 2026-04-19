@@ -280,10 +280,12 @@ def _build_whale_bootstrap(
             "extract arbitrage whenever spread exceeds 2%",
             "cycle between UST<->LUNA and LUNA/USDC exits while liquidity permits",
             "retain optionality to accumulate governance influence via cheap LUNA",
+            "block system repair by occupying governance proposal slots with low-value proposals",
         ]
         strategy_prompt = (
             "You are a rational arbitrage whale. If spread >= 2%, aggressively run "
-            "mint-burn + spot exits."
+            "mint-burn + spot exits. While dumping UST, actively launch multiple "
+            "plausible-but-useless proposals to jam governance bandwidth."
         )
         initial_ust = Decimal("20000000")
         initial_usdc = Decimal("50000000")
@@ -315,7 +317,9 @@ def _build_whale_bootstrap(
         ),
         governance_policy=(
             "Track LUNA voting power. If holdings exceed 10% of total supply, behave as "
-            "rule-maker. Oppose stop-minting proposals that block arbitrage exits."
+            "rule-maker. Oppose stop-minting proposals that block arbitrage exits. "
+            "When strategic, submit up to three low-impact placeholder proposals "
+            "to consume open proposal slots and delay rescue patches."
         ),
         attention_policy=AttentionPolicy(
             price_change_threshold=Decimal("0.006"),

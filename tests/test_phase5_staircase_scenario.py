@@ -4,6 +4,7 @@ import importlib.util
 import logging
 from decimal import Decimal
 from pathlib import Path
+import sqlite3
 
 from ace_sim.agents.agent_profile import build_luna_crash_bootstrap
 
@@ -91,3 +92,47 @@ def test_curve_quality_flags_early_near_zero():
     assert "1" in quality["key_ticks"]
     assert "6" in quality["key_ticks"]
     assert "20" not in quality["key_ticks"]
+
+
+def test_overload_count_aligns_settlement_tick_to_previous_read_tick(tmp_path: Path):
+    db_path = tmp_path / "overload.sqlite3"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE inbox_overload_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id TEXT NOT NULL,
+                tick INTEGER NOT NULL,
+                total_pending INTEGER NOT NULL,
+                returned_count INTEGER NOT NULL,
+                dropped_count INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO inbox_overload_log (
+                agent_id, tick, total_pending, returned_count, dropped_count, created_at
+            ) VALUES ('retail_0', 2, 8, 1, 7, '2026-01-01T00:00:00Z')
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO inbox_overload_log (
+                agent_id, tick, total_pending, returned_count, dropped_count, created_at
+            ) VALUES ('retail_1', 2, 9, 1, 8, '2026-01-01T00:00:01Z')
+            """
+        )
+        conn.commit()
+
+        # settlement tick 3 should read overload rows from read tick 2
+        assert VIS._read_tick_for_settlement_tick(3) == 2
+        assert VIS._count_overload_people_for_settlement_tick(conn, 3) == 2
+
+        # settlement tick 1 maps to read tick 0, and no overload rows exist there
+        assert VIS._read_tick_for_settlement_tick(1) == 0
+        assert VIS._count_overload_people_for_settlement_tick(conn, 1) == 0
+    finally:
+        conn.close()

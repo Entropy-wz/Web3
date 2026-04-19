@@ -92,6 +92,40 @@ def test_proposal_fee_and_anti_spam_limits(tmp_path):
     assert engine.fee_vault["LUNA"] == Decimal("3000")
 
 
+def test_governance_dos_blocks_project_rescue_proposal(tmp_path):
+    engine, orchestrator = _new_stack(
+        tmp_path,
+        voting_window_ticks=20,
+        max_open_proposals=3,
+        max_open_per_agent=3,
+    )
+    engine.create_account("whale_1", luna="4000", ust="1000000")
+    engine.create_account("project_0", luna="8000")
+
+    orchestrator.submit_event(
+        "whale_1",
+        "PROPOSE",
+        {"proposal_text": "Update protocol logo style guidelines for social media banners."},
+    )
+    orchestrator.submit_event(
+        "whale_1",
+        "PROPOSE",
+        {"proposal_text": "Allocate a symbolic community meme budget with no economic impact."},
+    )
+    orchestrator.submit_event(
+        "whale_1",
+        "PROPOSE",
+        {"proposal_text": "Start a low-priority ecosystem slogan contest without parameter changes."},
+    )
+
+    with pytest.raises(ProposalLimitError, match="open proposal limit reached"):
+        orchestrator.submit_event(
+            "project_0",
+            "PROPOSE",
+            {"proposal_text": "Disable minting and set swap fee to 0.01"},
+        )
+
+
 def test_settlement_rules_quorum_and_majority(tmp_path):
     # quorum fail
     engine1, orch1 = _new_stack(tmp_path / "q1", proposal_fee_luna="10", voting_window_ticks=1)
