@@ -3,8 +3,11 @@
 from dataclasses import dataclass
 from decimal import Decimal
 
+import pytest
+
 from ace_sim.agents.agent_profile import AgentProfile, default_agent_profile
 from ace_sim.agents.base_agent import RetailAgent
+from ace_sim.cognition.llm_brain import LLMBrain
 from ace_sim.cognition.llm_router import LLMRouter
 from ace_sim.cognition.memory_stream import MemoryStream
 from ace_sim.engine.ace_engine import ACE_Engine
@@ -37,6 +40,42 @@ class _AlwaysFailAdapter:
         del model, prompt, timeout, schema
         self.calls += 1
         raise RuntimeError("503 service unavailable")
+
+
+@dataclass
+class _MalformedAdapter:
+    def __post_init__(self) -> None:
+        self.calls = 0
+
+    def generate(self, *, model: str, prompt: str, timeout: float, schema=None):
+        del model, prompt, timeout, schema
+        self.calls += 1
+        return {
+            "thought": "panic rising",
+            "speak": "please be careful",
+            "action": "SWAP",
+        }
+
+
+@dataclass
+class _MalformedThenValidAdapter:
+    def __post_init__(self) -> None:
+        self.calls = 0
+
+    def generate(self, *, model: str, prompt: str, timeout: float, schema=None):
+        del model, prompt, timeout, schema
+        self.calls += 1
+        if self.calls == 1:
+            return {
+                "thought": "panic rising",
+                "speak": "is this safe?",
+                "action": "SWAP",
+            }
+        return {
+            "thought": "recovered format",
+            "speak": {"target": "forum", "message": "stay calm", "mode": "new"},
+            "action": None,
+        }
 
 
 def _stack(tmp_path):
@@ -98,6 +137,80 @@ def test_router_retry_then_success_and_fallback():
     degraded = router.route(profile, prompt="panic", timeout=1.0)
     assert degraded.used_fallback is True
     assert degraded.backend_used == "fallback"
+
+
+def test_router_auto_repairs_common_shape_errors(monkeypatch):
+    monkeypatch.setenv("ACE_LLM_AUTO_REPAIR_FORMAT", "1")
+    monkeypatch.setenv("ACE_LLM_FORMAT_RETRY_ONCE", "0")
+
+    router = LLMRouter(max_retries=0, base_backoff_seconds=0.001, jitter_seconds=0.0)
+    profile = AgentProfile(
+        agent_id="retail_bad_shape",
+        role="retail",
+        llm_backend="custom",
+        llm_model="mini",
+        risk_threshold=Decimal("0.5"),
+    )
+    adapter = _MalformedAdapter()
+    router.register_adapter("custom", adapter)
+
+    result = router.route(profile, prompt="panic", timeout=1.0)
+
+    assert result.used_fallback is False
+    assert result.decision["speak"] == {
+        "target": "forum",
+        "message": "please be careful",
+        "mode": "new",
+    }
+    assert result.decision["action"] is None
+    assert adapter.calls == 1
+
+
+def test_router_format_retry_recovers_when_repair_disabled(monkeypatch):
+    monkeypatch.setenv("ACE_LLM_AUTO_REPAIR_FORMAT", "0")
+    monkeypatch.setenv("ACE_LLM_FORMAT_RETRY_ONCE", "1")
+
+    router = LLMRouter(max_retries=0, base_backoff_seconds=0.001, jitter_seconds=0.0)
+    profile = AgentProfile(
+        agent_id="retail_retry",
+        role="retail",
+        llm_backend="custom",
+        llm_model="mini",
+        risk_threshold=Decimal("0.5"),
+    )
+    adapter = _MalformedThenValidAdapter()
+    router.register_adapter("custom", adapter)
+
+    result = router.route(profile, prompt="panic", timeout=1.0)
+
+    assert result.used_fallback is False
+    assert result.decision["thought"] == "recovered format"
+    assert adapter.calls == 2
+
+
+def test_panic_prompt_has_hard_output_contract():
+    brain = LLMBrain()
+    profile = AgentProfile(
+        agent_id="retail_panic_zz",
+        role="retail",
+        llm_backend="openai",
+        llm_model="gpt-4o-mini",
+        risk_threshold=Decimal("0.3"),
+        persona_type="retail_panic_prone",
+        hidden_goals=["preserve principal"],
+    )
+    prompt = brain.build_prompt(
+        profile=profile,
+        public_state={"tick": 1, "oracle_price_usdc_per_luna": "1.0"},
+        inbox_messages=[],
+        recalled_memories=[],
+        allowed_actions=["SWAP", "SPEAK"],
+    )
+
+    assert "Output contract (must follow exactly):" in prompt
+    assert "Never output speak as plain string." in prompt
+    assert "Never output action as plain string." in prompt
+    assert "Panic persona strictness override:" in prompt
 
 
 def test_memory_stream_local_embedding_and_query(tmp_path):

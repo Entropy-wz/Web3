@@ -100,21 +100,31 @@ python scripts/tools/check_llm_api.py --timeout 12 --output-json artifacts/prefl
 [`docs/PARAMETER_REFERENCE.md`](docs/PARAMETER_REFERENCE.md)
 
 ## 6. 主要运行命令
+说明：
+1. `--scenario` 默认值为 `staircase_formal_run`（可选 `default`）。
+2. `--retail` 会自动约束在 `21-27` 区间。
+3. `phase5_governance_visualizer.py` 默认会在仿真结束后自动生成论文图（2x2 + 4单图，PNG+PDF）。
+
 ### 6.1 Phase 5 治理与看板（默认 API 模式）
 ```bash
-python scripts/visualization/phase5_governance_visualizer.py --ticks 80 --retail 30 --output-dir artifacts/phase5
+python scripts/visualization/phase5_governance_visualizer.py --ticks 80 --retail 21 --output-dir artifacts/phase5
 ```
 
-### 6.2 Phase 5 离线规则模式（不走 API）
+### 6.2 Phase 5 阶梯式死亡螺旋场景（推荐）
 ```bash
-python scripts/visualization/phase5_governance_visualizer.py --offline-rules --ticks 80 --retail 30 --output-dir artifacts/phase5_offline
+python scripts/visualization/phase5_governance_visualizer.py --ticks 80 --retail 24 --scenario staircase_formal_run --pool-a-init 10000000,10000000 --shock-t1 1000000 --shock-t3 500000 --shock-t6 300000 --retail-ust-cap 5000000 --seed 42 --output-dir artifacts/staircase_formal_api
 ```
 
-### 6.3 常用日志参数
+### 6.3 Phase 5 离线规则模式（不走 API）
+```bash
+python scripts/visualization/phase5_governance_visualizer.py --offline-rules --ticks 80 --retail 21 --output-dir artifacts/phase5_offline
+```
+
+### 6.4 常用日志参数
 ```bash
 python scripts/visualization/phase5_governance_visualizer.py \
   --ticks 80 \
-  --retail 30 \
+  --retail 21 \
   --output-dir artifacts/phase5 \
   --progress-interval 1 \
   --log-file logs/simulation_run.log \
@@ -122,6 +132,16 @@ python scripts/visualization/phase5_governance_visualizer.py \
 ```
 
 可关闭心跳日志：`--no-progress`
+
+### 6.5 关闭自动论文图（可选）
+```bash
+python scripts/visualization/phase5_governance_visualizer.py --ticks 80 --retail 21 --output-dir artifacts/phase5 --no-paper-charts
+```
+
+### 6.6 单独重跑论文图（可选）
+```bash
+python scripts/visualization/paper_charts_generator.py --metrics artifacts/phase5/metrics.csv --summary artifacts/phase5/summary.json --db artifacts/phase5/phase5_trace.sqlite3 --formats png,pdf --dpi 300
+```
 
 ## 7. 日志与可观测性（Phase 5 增强）
 所有日志统一写入终端 + 文件（默认 `logs/simulation_run.log`）。
@@ -148,6 +168,14 @@ python scripts/visualization/phase5_governance_visualizer.py \
 2. `artifacts/phase5/phase5_dashboard.png`
 3. `artifacts/phase5/summary.json`
 4. `artifacts/phase5/checkpoints/tick_*.json`
+5. `artifacts/phase5/paper_dashboard_2x2.(png|pdf)`
+6. `artifacts/phase5/chart1~chart4.(png|pdf)`
+7. `artifacts/phase5/shape_report.json`
+
+### 8.3 Git 备份注意事项（小补充）
+1. 默认不会把 `artifacts` 下的大体量实验产物提交到 Git。
+2. 默认不会把本地虚拟环境目录（如 `.venv/`、`venv/`）提交到 Git。
+3. 如果历史上已经跟踪过大文件，先执行：`git rm -r --cached artifacts data .venv venv`，再重新提交。
 
 ## 9. 论文指标口径
 当前稳定输出：

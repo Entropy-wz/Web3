@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 import random
 import threading
 import time
@@ -215,6 +216,14 @@ class LLMRouter:
         self.max_retries = int(max_retries)
         self.base_backoff_seconds = float(base_backoff_seconds)
         self.jitter_seconds = float(jitter_seconds)
+        self.enable_format_repair = _env_bool(
+            "ACE_LLM_AUTO_REPAIR_FORMAT",
+            default=True,
+        )
+        self.enable_format_retry_once = _env_bool(
+            "ACE_LLM_FORMAT_RETRY_ONCE",
+            default=True,
+        )
 
         self._semaphore = threading.Semaphore(max_concurrent)
         self._bucket = TokenBucket(
@@ -248,20 +257,25 @@ class LLMRouter:
         schema: dict[str, Any] | None = None,
         timeout: float = 20.0,
     ) -> RouteResult:
+        agent_id = str(profile.agent_id).strip() or "unknown"
         backend = str(profile.llm_backend).strip().lower() or "rule"
         model = str(profile.llm_model).strip() or "rule-model"
 
         adapter = self._adapters.get(backend)
         if adapter is None:
             LOGGER.warning(
-                "[LLM-WARN] unknown backend=%s model=%s, fallback enabled",
+                "[LLM-WARN] unknown backend=%s model=%s agent=%s, fallback enabled",
                 backend,
                 model,
+                agent_id,
             )
             return self._fallback(profile=profile, error=f"unknown backend: {backend}")
 
         error_message: str | None = None
+        format_retry_used = False
         for attempt in range(self.max_retries + 1):
+            raw_preview: str | None = None
+            raw: Any = None
             try:
                 raw = self._execute_with_controls(
                     adapter=adapter,
@@ -270,6 +284,7 @@ class LLMRouter:
                     timeout=timeout,
                     schema=schema,
                 )
+                raw_preview = self._preview_raw(raw)
                 decision = self._coerce_decision(raw)
                 return RouteResult(
                     decision=decision,
@@ -279,26 +294,116 @@ class LLMRouter:
                     error=None,
                 )
             except Exception as exc:  # noqa: BLE001
+                if self.enable_format_repair:
+                    repaired = self._try_repair_decision(raw)
+                    if repaired is not None:
+                        LOGGER.warning(
+                            "[LLM-WARN] malformed output repaired backend=%s model=%s agent=%s reason=%s",
+                            backend,
+                            model,
+                            agent_id,
+                            str(exc),
+                        )
+                        return RouteResult(
+                            decision=repaired,
+                            backend_used=backend,
+                            model_used=model,
+                            used_fallback=False,
+                            error=f"format_repaired: {str(exc)}",
+                        )
+
+                if (
+                    self.enable_format_retry_once
+                    and not format_retry_used
+                    and self._is_format_error(exc)
+                    and raw_preview is not None
+                ):
+                    format_retry_used = True
+                    raw_retry: Any = None
+                    retry_preview: str | None = None
+                    try:
+                        repair_prompt = self._build_format_retry_prompt(
+                            original_prompt=prompt,
+                            raw_preview=raw_preview,
+                            error_message=str(exc),
+                        )
+                        raw_retry = self._execute_with_controls(
+                            adapter=adapter,
+                            model=model,
+                            prompt=repair_prompt,
+                            timeout=timeout,
+                            schema=schema,
+                        )
+                        retry_preview = self._preview_raw(raw_retry)
+                        decision_retry = self._coerce_decision(raw_retry)
+                        LOGGER.warning(
+                            "[LLM-WARN] malformed output recovered by retry backend=%s model=%s agent=%s",
+                            backend,
+                            model,
+                            agent_id,
+                        )
+                        return RouteResult(
+                            decision=decision_retry,
+                            backend_used=backend,
+                            model_used=model,
+                            used_fallback=False,
+                            error="format_retry_recovered",
+                        )
+                    except Exception as retry_exc:  # noqa: BLE001
+                        if self.enable_format_repair:
+                            repaired_retry = self._try_repair_decision(raw_retry)
+                            if repaired_retry is not None:
+                                LOGGER.warning(
+                                    "[LLM-WARN] malformed output repaired after retry backend=%s model=%s agent=%s reason=%s",
+                                    backend,
+                                    model,
+                                    agent_id,
+                                    str(retry_exc),
+                                )
+                                return RouteResult(
+                                    decision=repaired_retry,
+                                    backend_used=backend,
+                                    model_used=model,
+                                    used_fallback=False,
+                                    error=f"format_retry_then_repair: {str(retry_exc)}",
+                                )
+                        exc = retry_exc
+                        raw_preview = retry_preview
+
                 error_message = str(exc)
                 retryable = self._is_retryable_error(exc)
                 attempt_no = attempt + 1
                 max_attempts = self.max_retries + 1
                 if attempt >= self.max_retries or not retryable:
                     LOGGER.warning(
-                        "[LLM-WARN] request failed backend=%s model=%s attempt=%d/%d retryable=%s error=%s",
+                        "[LLM-WARN] request failed backend=%s model=%s agent=%s attempt=%d/%d retryable=%s error=%s",
                         backend,
                         model,
+                        agent_id,
                         attempt_no,
                         max_attempts,
                         retryable,
                         error_message,
                     )
+                    if (
+                        raw_preview is not None
+                        and os.getenv("ACE_LOG_RAW_LLM_ON_PARSE_ERROR", "0").strip().lower()
+                        in {"1", "true", "yes"}
+                    ):
+                        LOGGER.warning(
+                            "[LLM-WARN] raw_response_preview backend=%s model=%s agent=%s preview=%s",
+                            backend,
+                            model,
+                            agent_id,
+                            raw_preview,
+                        )
                     break
                 delay = self._sleep_backoff(attempt)
                 LOGGER.warning(
-                    "[LLM-WARN] transient error backend=%s model=%s attempt=%d/%d backoff=%.3fs error=%s",
+                    "[LLM-WARN] transient error backend=%s model=%s agent=%s attempt=%d/%d backoff=%.3fs error=%s",
                     backend,
                     model,
+                    agent_id,
                     attempt_no,
                     max_attempts,
                     delay,
@@ -334,9 +439,10 @@ class LLMRouter:
     def _fallback(self, profile: AgentProfile, error: str | None) -> RouteResult:
         if error:
             LOGGER.warning(
-                "[LLM-WARN] fallback activated role=%s model=%s reason=%s",
+                "[LLM-WARN] fallback activated role=%s model=%s agent=%s reason=%s",
                 profile.role,
                 profile.llm_model,
+                profile.agent_id,
                 error,
             )
         raw = self._fallback_adapter.generate(
@@ -380,6 +486,102 @@ class LLMRouter:
             "action": action,
         }
 
+    def _try_repair_decision(self, raw: Any) -> dict[str, Any] | None:
+        if raw is None:
+            return None
+        parsed: Any = raw
+        if isinstance(raw, str):
+            try:
+                parsed = json.loads(raw)
+            except Exception:  # noqa: BLE001
+                return None
+        if not isinstance(parsed, dict):
+            return None
+
+        thought_val = parsed.get("thought")
+        if isinstance(thought_val, str) and thought_val.strip():
+            thought = thought_val.strip()
+        else:
+            thought = "No valid thought provided; keep conservative posture."
+
+        speak_val = parsed.get("speak")
+        if isinstance(speak_val, dict):
+            speak = speak_val
+        elif isinstance(speak_val, str):
+            msg = speak_val.strip()
+            speak = (
+                {"target": "forum", "message": msg, "mode": "new"}
+                if msg
+                else None
+            )
+        else:
+            speak = None
+
+        action_val = parsed.get("action")
+        if isinstance(action_val, dict) and "action_type" in action_val:
+            action = action_val
+        else:
+            action = None
+
+        try:
+            return self._coerce_decision(
+                {
+                    "thought": thought,
+                    "speak": speak,
+                    "action": action,
+                }
+            )
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _preview_raw(self, raw: Any, max_len: int = 800) -> str:
+        if isinstance(raw, str):
+            text = raw
+        else:
+            try:
+                text = json.dumps(raw, ensure_ascii=False)
+            except Exception:  # noqa: BLE001
+                text = str(raw)
+        condensed = " ".join(text.split())
+        if len(condensed) > max_len:
+            return condensed[: max_len - 3] + "..."
+        return condensed
+
+    def _build_format_retry_prompt(
+        self,
+        *,
+        original_prompt: str,
+        raw_preview: str,
+        error_message: str,
+    ) -> str:
+        return "\n".join(
+            [
+                "The previous output violated required JSON shape.",
+                f"Validation error: {error_message}",
+                "Fix only structure while preserving intent.",
+                "Return strict JSON object with keys: thought, speak, action.",
+                "Rules:",
+                "- thought: non-empty string",
+                "- speak: object or null",
+                "- action: object or null",
+                "If speak is plain text, wrap as:",
+                '{"target":"forum","message":"...","mode":"new"}',
+                "If action is uncertain, set action to null.",
+                f"Previous output: {raw_preview}",
+                f"Original task context: {original_prompt}",
+            ]
+        )
+
+    def _is_format_error(self, exc: Exception) -> bool:
+        text = str(exc).lower()
+        tokens = [
+            "speak must be object or null",
+            "action must be object or null",
+            "thought must be non-empty string",
+            "model output must be dict/json",
+        ]
+        return any(token in text for token in tokens)
+
     def _is_retryable_error(self, exc: Exception) -> bool:
         text = str(exc).lower()
         retry_tokens = ["429", "rate limit", "timeout", "timed out", "5xx", "503", "502", "connection"]
@@ -391,6 +593,18 @@ class LLMRouter:
         delay = base + jitter
         time.sleep(delay)
         return delay
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    text = str(raw).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return default
 
 
 __all__ = [

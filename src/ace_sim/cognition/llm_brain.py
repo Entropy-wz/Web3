@@ -124,18 +124,42 @@ class LLMBrain:
         sections = [
             "You are a Web3 market participant in a multi-agent crisis simulation.",
             f"Role: {profile.role}",
+            f"Persona: {profile.persona_type}",
             f"Hidden goals: {json.dumps(profile.hidden_goals, ensure_ascii=False)}",
+            f"Strategy directive: {profile.strategy_prompt}",
+            f"Social policy: {profile.social_policy}",
+            f"Governance policy: {profile.governance_policy}",
             f"Risk threshold: {profile.risk_threshold}",
             f"Current state: {json.dumps(state_view, ensure_ascii=False)}",
             f"Inbox: {json.dumps(inbox_messages, ensure_ascii=False)}",
             f"Relevant memory: {json.dumps(memory_view, ensure_ascii=False)}",
             f"Allowed actions: {json.dumps(allowed_actions, ensure_ascii=False)}",
+            "Output contract (must follow exactly):",
+            "- Top-level keys must be exactly: thought, speak, action.",
+            "- thought must be a non-empty string.",
+            "- speak must be an object or null. Never output speak as plain string.",
+            "- action must be an object or null. Never output action as plain string.",
+            "- If uncertain, set speak=null and/or action=null.",
+            "Invalid examples (do NOT do):",
+            '- {"thought":"...","speak":"panic text","action":"SWAP"}',
+            '- {"thought":"...","speak":null,"action":"SWAP"}',
+            "Valid minimal example:",
+            '{"thought":"...","speak":null,"action":null}',
             (
                 "Return strict JSON only: "
                 '{"thought":"...","speak":{...}|null,"action":{...}|null}. '
                 "No markdown, no extra keys."
             ),
         ]
+        if str(profile.persona_type).strip().lower() == "retail_panic_prone":
+            sections.extend(
+                [
+                    "Panic persona strictness override:",
+                    "- Even under panic, keep JSON shape valid.",
+                    "- Never put emotional sentence directly in speak field as string.",
+                    "- If you want to speak, wrap it as object with target/message/mode.",
+                ]
+            )
         return "\n".join(sections)
 
     def _compress_public_state(self, public_state: dict[str, Any]) -> dict[str, Any]:

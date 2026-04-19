@@ -186,13 +186,33 @@
 | 参数名 | 可选参数（默认） | 作用 |
 |---|---|---|
 | `--ticks` | `int`（默认 `80`） | 仿真 tick 数。 |
-| `--retail` | `int`（默认 `30`） | 散户数量。 |
+| `--retail` | `int`（默认 `21`） | 散户数量（脚本会约束到 21-27 区间）。 |
+| `--scenario` | `default` 或 `staircase_formal_run`（默认 `staircase_formal_run`） | 选择实验场景预设。 |
 | `--seed` | `int`（默认 `42`） | 随机种子。 |
 | `--output-dir` | 路径（默认 `artifacts/phase5`） | 产物输出目录。 |
 | `--offline-rules` | 开关（默认关闭） | 启用离线规则模式（不走 API）。 |
 | `--llm-agent-count` | `int`（默认 `12`） | 由运行时控制的 agent 数量。 |
+| `--llm-max-concurrent` | `int>0` 或不填（默认不填） | 覆盖全局并发上限；不填则使用配置文件值。 |
 | `--preflight-timeout` | `float`（默认 `12.0`） | API 预检查单角色超时。 |
 | `--max-inbox-size` | `int`（默认 `5`） | 每 tick 每 agent 的 inbox 上限。 |
+| `--ticks-per-day` | `int>0`（默认 `100`） | 仿真时钟中一天对应的 tick 数。 |
+| `--voting-window-ticks` | `int>0`（默认 `20`） | 治理投票窗口长度。 |
+| `--disable-black-swan` | 开关（默认关闭） | 关闭场景黑天鹅冲击注入。 |
+| `--shock-t1` | 正数（默认 `1000000`） | 阶梯冲击在 Tick 1 的 UST 抛压规模。 |
+| `--shock-t3` | 正数（默认 `500000`） | 阶梯冲击在 Tick 3 的 UST 抛压规模。 |
+| `--shock-t6` | 正数（默认 `300000`） | 阶梯冲击在 Tick 6 的 UST 抛压规模。 |
+| `--pool-a-init` | `UST,USDC` 二元组（默认 `10000000,10000000`） | 设置 `Pool_A` 初始储备；`staircase_formal_run` 下 `Pool_B` 同步放大。 |
+| `--retail-ust-cap` | 正数（默认 `5000000`） | 阶梯场景下散户 UST 总量上限。 |
+| `--no-paper-charts` | 开关（默认关闭） | 关闭“仿真结束自动生成论文图”。 |
+| `--paper-chart-formats` | 逗号分隔格式（默认 `png,pdf`） | 自动论文图导出格式。 |
+| `--paper-chart-dpi` | `int>0`（默认 `300`） | 自动论文图 PNG 分辨率。 |
+| `--paper-chart-style` | 字符串（默认 `whitegrid`） | 自动论文图主题风格。 |
+| `--paper-chart-font-size` | `int>0`（默认 `14`） | 自动论文图全局字号。 |
+| `--paper-chart-congestion-scale` | `linear` 或 `log`（默认 `linear`） | 自动论文图拥堵线坐标尺度。 |
+| `--paper-chart-strict-shape-check` | 开关（默认关闭） | 开启 L 型断崖严格拦截。 |
+| `--paper-chart-shape-report-json` | 路径或空 | 指定形态诊断 JSON 输出位置。 |
+| `--paper-chart-output-dir` | 路径或空 | 自动论文图输出目录（默认跟随本次 `output-dir`）。 |
+| `--paper-chart-fail-hard` | 开关（默认关闭） | 自动论文图失败时中断整次实验。 |
 | `--no-progress` | 开关（默认关闭） | 关闭每 tick 心跳日志。 |
 | `--progress-interval` | `int>0`（默认 `1`） | 心跳日志间隔 tick。 |
 | `--log-file` | 路径（默认 `logs/simulation_run.log`） | 日志文件位置。 |
@@ -243,6 +263,22 @@
 | 参数名 | 可选参数（默认） | 作用 |
 |---|---|---|
 | `--db` | SQLite 路径（默认 `data/sqlite/ace_demo.sqlite3`） | 生成人类可读流水报告。 |
+
+### 9.7 `scripts/visualization/paper_charts_generator.py`
+
+| 参数名 | 可选参数（默认） | 作用 |
+|---|---|---|
+| `--metrics` | 路径（必填） | 输入 `metrics.csv`。 |
+| `--summary` | 路径（必填） | 输入 `summary.json`。 |
+| `--db` | 路径或空 | 可选 SQLite，用于精确规则生效 Tick。 |
+| `--output-dir` | 路径或空（默认空） | 输出目录；不填则跟随 `metrics.csv` 目录。 |
+| `--dpi` | `int>0`（默认 `300`） | PNG 分辨率。 |
+| `--style` | 字符串（默认 `whitegrid`） | seaborn 风格。 |
+| `--formats` | 逗号分隔（默认 `png,pdf`） | 导出格式集合。 |
+| `--font-size` | `int>0`（默认 `14`） | 全局字号。 |
+| `--congestion-scale` | `linear` 或 `log`（默认 `linear`） | 拥堵曲线坐标尺度。 |
+| `--strict-shape-check` | 开关（默认关闭） | L 型断崖时直接失败退出。 |
+| `--shape-report-json` | 路径或空 | 形态诊断 JSON 输出位置。 |
 
 ## 10. 建议优先调参顺序
 

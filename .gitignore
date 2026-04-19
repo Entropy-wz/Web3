@@ -39,7 +39,10 @@ ENV/
 Thumbs.db
 
 # --- Project runtime outputs ---
-artifacts/
+# Keep directory placeholders only; ignore heavy run outputs by default.
+artifacts/**
+!artifacts/.gitkeep
+!artifacts/README.md
 
 # --- Large local datasets / databases (do not upload) ---
 data/**

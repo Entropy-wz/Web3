@@ -119,6 +119,15 @@ ACE-Sim 采用五层架构：
 3. 提案 ID。
 4. 旧值（可读取时输出）。
 
+### 4.4 自动论文图流水线（补充）
+默认行为：`phase5_governance_visualizer.py` 在主仿真结束后自动调用 `paper_charts_generator.py`。  
+默认落盘到本次 `output-dir`：  
+1. `paper_dashboard_2x2.(png|pdf)`  
+2. `chart1~chart4.(png|pdf)`  
+3. `shape_report.json`  
+
+可通过 `--no-paper-charts` 关闭自动出图。
+
 ## 5. 配置体系与参数入口
 ### 5.1 LLM 配置
 默认路径：`config/llm_config.toml`
@@ -134,9 +143,13 @@ ACE-Sim 采用五层架构：
 1. `ACE_Engine`：`minting_allowed`、`swap_fee`、`daily_mint_cap`。
 2. `Simulation_Orchestrator`：`ticks_per_day`、`max_tx_per_tick`、`default_max_inbox_size`。
 3. `GovernanceModule`：`proposal_fee_luna`、`max_open_proposals`、`max_open_per_agent`、`voting_window_ticks`、`quorum_ratio`。
-4. Phase 5 脚本参数：`--no-progress`、`--progress-interval`、`--log-file`、`--log-level`。
+4. Phase 5 脚本参数：`--scenario`、`--pool-a-init`、`--shock-t1/--shock-t3/--shock-t6`、`--retail-ust-cap`、`--ticks-per-day`、`--voting-window-ticks`、`--llm-max-concurrent`、`--no-progress`、`--progress-interval`、`--log-file`、`--log-level`。
 
 ## 6. 运行与复现实验
+说明：
+1. `--scenario` 默认值为 `staircase_formal_run`（可选 `default`）。
+2. `--retail` 会自动约束在 `21-27` 区间。
+
 ### 6.1 环境准备
 ```bash
 git clone https://github.com/Entropy-wz/Web3.git
@@ -167,12 +180,22 @@ python scripts/tools/check_llm_api.py --timeout 12 --output-json artifacts/prefl
 
 ### 6.4 Phase 5 主实验（默认 API）
 ```bash
-python scripts/visualization/phase5_governance_visualizer.py --ticks 80 --retail 30 --output-dir artifacts/phase5
+python scripts/visualization/phase5_governance_visualizer.py --ticks 80 --retail 21 --output-dir artifacts/phase5
 ```
 
-### 6.5 Phase 5 离线实验（不调用 API）
+### 6.5 Phase 5 阶梯式死亡螺旋场景（推荐）
 ```bash
-python scripts/visualization/phase5_governance_visualizer.py --offline-rules --ticks 80 --retail 30 --output-dir artifacts/phase5_offline
+python scripts/visualization/phase5_governance_visualizer.py --ticks 80 --retail 24 --scenario staircase_formal_run --pool-a-init 10000000,10000000 --shock-t1 1000000 --shock-t3 500000 --shock-t6 300000 --retail-ust-cap 5000000 --seed 42 --output-dir artifacts/staircase_formal_api
+```
+
+### 6.6 Phase 5 离线实验（不调用 API）
+```bash
+python scripts/visualization/phase5_governance_visualizer.py --offline-rules --ticks 80 --retail 21 --output-dir artifacts/phase5_offline
+```
+
+### 6.7 自动论文图参数（补充）
+```bash
+python scripts/visualization/phase5_governance_visualizer.py --ticks 80 --retail 24 --paper-chart-formats png,pdf --paper-chart-dpi 300 --paper-chart-font-size 14 --paper-chart-congestion-scale linear
 ```
 
 ## 7. 数据存储与结果落盘
@@ -191,6 +214,11 @@ python scripts/visualization/phase5_governance_visualizer.py --offline-rules --t
 3. `artifacts/phase5/summary.json`
 4. `artifacts/phase5/checkpoints/tick_*.json`
 5. `logs/simulation_run.log`
+6. `artifacts/phase5/paper_dashboard_2x2.(png|pdf)`
+7. `artifacts/phase5/chart1~chart4.(png|pdf)`
+8. `artifacts/phase5/shape_report.json`
+
+补充说明：仓库默认 `.gitignore` 会忽略 `artifacts` 大体量产物与本地虚拟环境（`.venv/`、`venv/`），避免备份体积失控。
 
 ## 8. 论文指标口径
 按 Tick 输出：
@@ -205,6 +233,7 @@ python scripts/visualization/phase5_governance_visualizer.py --offline-rules --t
 1. `pytest -q` 全部通过。
 2. Phase 5 运行后，`summary.json`、`metrics.csv`、`phase5_dashboard.png`、`simulation_run.log` 均生成。
 3. 日志中可看到 `[SOCIAL]`、`[ACTION]`、`[WHALE-ACTION]`、`[GOV-EXEC]` 四类增强标签。
+4. 自动论文图开启时，`paper_dashboard_2x2`、`chart1~chart4` 与 `shape_report.json` 均生成。
 
 ## 10. 当前结论
 当前版本已经具备“可运行、可审计、可复盘、可出图”的完整闭环，可直接支撑 Phase 1-5 的连续实验与论文图表产出。

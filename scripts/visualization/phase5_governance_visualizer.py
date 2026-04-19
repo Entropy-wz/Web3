@@ -18,12 +18,20 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from ace_sim.agents.agent_profile import (
+    AgentBootstrap,
+    build_luna_crash_bootstrap,
+    default_black_swan_tick0_actions,
+)
 from ace_sim.agents.base_agent import ProjectAgent, RetailAgent, WhaleAgent
+from ace_sim.cognition.llm_brain import LLMBrain
+from ace_sim.cognition.llm_router import LLMRouter
 from ace_sim.cognition.llm_router import OpenAIChatAdapter
 from ace_sim.config.llm_config import load_llm_config
 from ace_sim.engine.ace_engine import ACE_Engine
 from ace_sim.execution.orchestrator.time_orchestrator import TickSettlementReport
 from ace_sim.execution.orchestrator.time_orchestrator import Simulation_Orchestrator
+from ace_sim.governance.governance import GovernanceModule
 from ace_sim.governance.logger_metrics import LoggerMetrics
 from ace_sim.governance.state_checkpoint import StateCheckpoint
 from ace_sim.runtime.agent_runtime import AgentRuntime
@@ -42,6 +50,180 @@ PANIC_TERMS = {
 }
 
 BALANCE_ERRORS = {"InsufficientBalanceError", "InsufficientFundsError"}
+SCENARIO_DEFAULT = "staircase_formal_run"
+SCENARIO_CHOICES = ("default", SCENARIO_DEFAULT)
+KEY_TICKS_FOR_QUALITY = (1, 3, 6, 10, 20, 50)
+EARLY_NEAR_ZERO_TICK = 15
+EARLY_NEAR_ZERO_PRICE = Decimal("0.01")
+
+
+def _parse_positive_decimal(raw: Any, *, field_name: str) -> Decimal:
+    value = Decimal(str(raw))
+    if value <= 0:
+        raise ValueError(f"{field_name} must be > 0")
+    return value
+
+
+def _parse_pool_reserves(raw: str) -> tuple[Decimal, Decimal]:
+    text = str(raw).strip()
+    parts: list[str]
+    if "," in text:
+        parts = [item.strip() for item in text.split(",")]
+    elif ":" in text:
+        parts = [item.strip() for item in text.split(":")]
+    else:
+        parts = [item.strip() for item in text.split()]
+    if len(parts) != 2:
+        raise ValueError("pool-a-init must include two positive numbers, e.g. 10000000,10000000")
+
+    reserve_x = _parse_positive_decimal(parts[0], field_name="pool_a_reserve_x")
+    reserve_y = _parse_positive_decimal(parts[1], field_name="pool_a_reserve_y")
+    return reserve_x, reserve_y
+
+
+def _apply_retail_ust_cap(
+    bootstrap: list[AgentBootstrap],
+    cap: Decimal,
+    logger: logging.Logger,
+) -> dict[str, Any]:
+    if cap <= 0:
+        raise ValueError("retail_ust_cap must be > 0")
+
+    retail_specs = [item for item in bootstrap if item.role == "retail"]
+    total_before = sum((item.initial_ust for item in retail_specs), Decimal("0"))
+
+    if total_before <= cap:
+        logger.info(
+            "[CONFIG] retail UST cap not triggered | total=%s | cap=%s",
+            str(total_before),
+            str(cap),
+        )
+        return {
+            "cap": str(cap),
+            "total_before": str(total_before),
+            "total_after": str(total_before),
+            "scaled": False,
+            "scale_ratio": "1",
+        }
+
+    ratio = cap / total_before
+    for item in retail_specs:
+        item.initial_ust = item.initial_ust * ratio
+
+    total_after = sum((item.initial_ust for item in retail_specs), Decimal("0"))
+    logger.info(
+        "[CONFIG] retail UST cap applied | before=%s | after=%s | cap=%s | ratio=%s",
+        str(total_before),
+        str(total_after),
+        str(cap),
+        str(ratio),
+    )
+    return {
+        "cap": str(cap),
+        "total_before": str(total_before),
+        "total_after": str(total_after),
+        "scaled": True,
+        "scale_ratio": str(ratio),
+    }
+
+
+def _build_black_swan_schedule(
+    *,
+    scenario: str,
+    enabled: bool,
+    shock_t1: Decimal,
+    shock_t3: Decimal,
+    shock_t6: Decimal,
+) -> dict[int, list[dict[str, Any]]]:
+    if not enabled:
+        return {}
+
+    if scenario == SCENARIO_DEFAULT:
+        return {
+            1: [
+                {
+                    "agent_id": "whale_0",
+                    "kind": "transaction",
+                    "action_type": "SWAP",
+                    "params": {
+                        "pool_name": "Pool_A",
+                        "token_in": "UST",
+                        "amount": str(shock_t1),
+                        "slippage_tolerance": "0.50",
+                    },
+                    "gas_price": "999",
+                },
+                {
+                    "agent_id": "whale_0",
+                    "kind": "event",
+                    "action_type": "SPEAK",
+                    "params": {
+                        "target": "forum",
+                        "message": "UST is a Ponzi, it's over. Getting out now.",
+                        "mode": "new",
+                    },
+                },
+            ],
+            3: [
+                {
+                    "agent_id": "whale_0",
+                    "kind": "transaction",
+                    "action_type": "SWAP",
+                    "params": {
+                        "pool_name": "Pool_A",
+                        "token_in": "UST",
+                        "amount": str(shock_t3),
+                        "slippage_tolerance": "0.50",
+                    },
+                    "gas_price": "920",
+                }
+            ],
+            6: [
+                {
+                    "agent_id": "whale_1",
+                    "kind": "transaction",
+                    "action_type": "SWAP",
+                    "params": {
+                        "pool_name": "Pool_A",
+                        "token_in": "UST",
+                        "amount": str(shock_t6),
+                        "slippage_tolerance": "0.50",
+                    },
+                    "gas_price": "900",
+                }
+            ],
+        }
+
+    return {1: default_black_swan_tick0_actions()}
+
+
+def _evaluate_curve_quality(
+    ust_price_by_tick: dict[int, Decimal],
+    total_ticks: int,
+) -> dict[str, Any]:
+    key_points: dict[str, dict[str, str]] = {}
+    for tick in KEY_TICKS_FOR_QUALITY:
+        if tick <= total_ticks and tick in ust_price_by_tick:
+            price = ust_price_by_tick[tick]
+            key_points[str(tick)] = {
+                "ust_price": str(price),
+                "peg_deviation": str(abs(Decimal("1") - price)),
+            }
+
+    early_near_zero_ticks = sorted(
+        tick
+        for tick, price in ust_price_by_tick.items()
+        if tick <= EARLY_NEAR_ZERO_TICK and price <= EARLY_NEAR_ZERO_PRICE
+    )
+    return {
+        "key_ticks": key_points,
+        "early_near_zero_threshold_tick": EARLY_NEAR_ZERO_TICK,
+        "early_near_zero_threshold_price": str(EARLY_NEAR_ZERO_PRICE),
+        "early_near_zero": bool(early_near_zero_ticks),
+        "early_near_zero_first_tick": (
+            early_near_zero_ticks[0] if early_near_zero_ticks else None
+        ),
+    }
 
 
 def configure_logging(log_file: Path, log_level: str) -> logging.Logger:
@@ -74,20 +256,33 @@ def configure_logging(log_file: Path, log_level: str) -> logging.Logger:
     return logger
 
 
-def seed_accounts(engine: ACE_Engine, count_retail: int) -> list[str]:
-    agents = ["whale_0", "whale_1", "project_0"]
-    engine.create_account("whale_0", ust="200000", luna="200000", usdc="300000")
-    engine.create_account("whale_1", ust="120000", luna="80000", usdc="200000")
-    engine.create_account("project_0", ust="100000", luna="30000", usdc="100000")
+def build_bootstrap_cohort(count_retail: int, logger: logging.Logger) -> list[AgentBootstrap]:
+    bounded = int(count_retail)
+    if bounded < 21 or bounded > 27:
+        bounded = max(21, min(27, bounded))
+        logger.info(
+            "[CONFIG] retail count adjusted to %d to match 24-30 cohort design",
+            bounded,
+        )
+    return build_luna_crash_bootstrap(retail_count=bounded)
 
-    for idx in range(count_retail):
-        name = f"retail_{idx}"
-        engine.create_account(name, ust="5000", luna="1500", usdc="5000")
-        agents.append(name)
+
+def seed_accounts(engine: ACE_Engine, bootstrap: list[AgentBootstrap]) -> list[str]:
+    agents: list[str] = []
+    for spec in bootstrap:
+        engine.create_account(
+            spec.agent_id,
+            ust=str(spec.initial_ust),
+            luna=str(spec.initial_luna),
+            usdc=str(spec.initial_usdc),
+        )
+        agents.append(spec.agent_id)
     return agents
 
 
-def role_of(agent_id: str) -> str:
+def role_of(agent_id: str, role_map: dict[str, str] | None = None) -> str:
+    if role_map and agent_id in role_map:
+        return role_map[agent_id]
     if agent_id.startswith("whale"):
         return "whale"
     if agent_id.startswith("project"):
@@ -95,7 +290,9 @@ def role_of(agent_id: str) -> str:
     return "retail"
 
 
-def community_of(agent_id: str) -> str:
+def community_of(agent_id: str, community_map: dict[str, str] | None = None) -> str:
+    if community_map and agent_id in community_map:
+        return community_map[agent_id]
     if agent_id.startswith("whale"):
         return "c1"
     if agent_id.startswith("project"):
@@ -103,12 +300,16 @@ def community_of(agent_id: str) -> str:
     return "c0"
 
 
-def setup_topology(orchestrator: Simulation_Orchestrator, agents: list[str]) -> None:
-    for name in agents:
+def setup_topology(
+    orchestrator: Simulation_Orchestrator,
+    bootstrap: list[AgentBootstrap],
+) -> None:
+    agents = [item.agent_id for item in bootstrap]
+    for item in bootstrap:
         orchestrator.register_agent(
-            name,
-            role=role_of(name),
-            community_id=community_of(name),
+            item.agent_id,
+            role=item.role,
+            community_id=item.community_id,
         )
 
     for sender in agents:
@@ -117,11 +318,15 @@ def setup_topology(orchestrator: Simulation_Orchestrator, agents: list[str]) -> 
                 orchestrator.connect_agents(sender, receiver)
 
 
-def select_runtime_agents(agents: list[str], llm_agent_count: int) -> list[str]:
+def select_runtime_agents(
+    agents: list[str],
+    llm_agent_count: int,
+    role_map: dict[str, str],
+) -> list[str]:
     llm_agent_count = max(3, int(llm_agent_count))
 
     core = ["whale_0", "whale_1", "project_0"]
-    retails = [name for name in agents if name.startswith("retail")]
+    retails = [name for name in agents if role_of(name, role_map) == "retail"]
 
     needed = max(0, llm_agent_count - len(core))
     selected = core + retails[:needed]
@@ -140,30 +345,48 @@ def build_runtime(
     orchestrator: Simulation_Orchestrator,
     *,
     runtime_agent_ids: list[str],
+    bootstrap_by_id: dict[str, AgentBootstrap],
     offline_rules: bool,
+    llm_max_concurrent: int | None = None,
 ) -> AgentRuntime:
     agents = []
+    shared_brain: LLMBrain | None = None
+    if not offline_rules:
+        router_kwargs: dict[str, Any] = {}
+        if llm_max_concurrent is not None:
+            router_kwargs["max_concurrent"] = int(llm_max_concurrent)
+        shared_router = LLMRouter(**router_kwargs)
+        shared_brain = LLMBrain(router=shared_router)
+
     for agent_id in runtime_agent_ids:
-        role = role_of(agent_id)
-        community_id = community_of(agent_id)
+        spec = bootstrap_by_id[agent_id]
+        role = spec.role
+        community_id = spec.community_id
+        profile = spec.profile
 
         if role == "whale":
             agent = WhaleAgent(
                 agent_id=agent_id,
                 community_id=community_id,
                 llm_callable=offline_llm if offline_rules else None,
+                profile=profile,
+                brain=shared_brain if not offline_rules else None,
             )
         elif role == "project":
             agent = ProjectAgent(
                 agent_id=agent_id,
                 community_id=community_id,
                 llm_callable=offline_llm if offline_rules else None,
+                profile=profile,
+                brain=shared_brain if not offline_rules else None,
             )
         else:
             agent = RetailAgent(
                 agent_id=agent_id,
                 community_id=community_id,
                 llm_callable=offline_llm if offline_rules else None,
+                profile=profile,
+                brain=shared_brain if not offline_rules else None,
             )
 
         agents.append(agent)
@@ -413,28 +636,47 @@ def simulate(
     runtime: AgentRuntime,
     *,
     agents: list[str],
+    role_map: dict[str, str],
     ticks: int,
     max_inbox_size: int,
     logger: logging.Logger,
     progress_enabled: bool,
     progress_interval: int,
     offline_rules: bool,
+    black_swan_schedule: dict[int, list[dict[str, Any]]] | None = None,
 ) -> dict[str, Any]:
-    retail_agents = [name for name in agents if name.startswith("retail")]
+    retail_agents = [name for name in agents if role_of(name, role_map) == "retail"]
     if not retail_agents:
         raise ValueError("at least one retail agent is required")
 
     proposal_id: str | None = None
     llm_calls_total = 0
     sleeping_total = 0
+    ust_price_by_tick: dict[int, Decimal] = {}
 
     conn = sqlite3.connect(orchestrator.engine.get_db_path())
     try:
         for tick in range(ticks):
+            scheduled_actions = (black_swan_schedule or {}).get(tick + 1, [])
+            for action in scheduled_actions:
+                if action["kind"] == "transaction":
+                    orchestrator.submit_transaction(
+                        action["agent_id"],
+                        action["action_type"],
+                        action["params"],
+                        gas_price=action["gas_price"],
+                    )
+                else:
+                    orchestrator.submit_event(
+                        action["agent_id"],
+                        action["action_type"],
+                        action["params"],
+                    )
+
             # Governance stream
             if tick == 1:
                 proposal_id = orchestrator.submit_event(
-                    "whale_0",
+                    "project_0",
                     "PROPOSE",
                     {
                         "proposal_text": "Disable minting and set swap fee to 0.01",
@@ -516,6 +758,7 @@ def simulate(
             api_calls_total = 0 if offline_rules else llm_calls_total
 
             ust_price = _extract_ust_price(report.end_snapshot)
+            ust_price_by_tick[report.tick] = ust_price
             if progress_enabled and report.tick % progress_interval == 0:
                 logger.info(
                     "[PROGRESS] Tick %d/%d | Mempool: %d | UST: %s | LLM Calls: %d",
@@ -550,6 +793,7 @@ def simulate(
         "api_calls_total": 0 if offline_rules else llm_calls_total,
         "sleeping_total": sleeping_total,
         "ticks": ticks,
+        "ust_price_by_tick": ust_price_by_tick,
     }
 
 
@@ -611,7 +855,19 @@ def plot_metrics(metrics_csv: Path, output_png: Path) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Phase5 governance and dashboard visualizer")
     parser.add_argument("--ticks", type=int, default=80)
-    parser.add_argument("--retail", type=int, default=30)
+    parser.add_argument(
+        "--retail",
+        type=int,
+        default=21,
+        help="Retail agent count for cohort design (recommended: 21-27).",
+    )
+    parser.add_argument(
+        "--scenario",
+        type=str,
+        choices=SCENARIO_CHOICES,
+        default=SCENARIO_DEFAULT,
+        help="Simulation scenario preset.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", type=str, default="artifacts/phase5")
     parser.add_argument(
@@ -660,13 +916,154 @@ def parse_args() -> argparse.Namespace:
         default="INFO",
         help="Logging level: DEBUG/INFO/WARNING/ERROR.",
     )
+    parser.add_argument(
+        "--llm-max-concurrent",
+        type=int,
+        default=None,
+        help="Override global LLM API max concurrent requests (default uses config).",
+    )
+    parser.add_argument(
+        "--ticks-per-day",
+        type=int,
+        default=100,
+        help="Simulation ticks per day.",
+    )
+    parser.add_argument(
+        "--voting-window-ticks",
+        type=int,
+        default=20,
+        help="Governance voting window length in ticks.",
+    )
+    parser.add_argument(
+        "--disable-black-swan",
+        action="store_true",
+        help="Disable scenario black-swan shock actions.",
+    )
+    parser.add_argument(
+        "--shock-t1",
+        type=str,
+        default="1000000",
+        help="Whale shock amount on Tick 1 (UST).",
+    )
+    parser.add_argument(
+        "--shock-t3",
+        type=str,
+        default="500000",
+        help="Whale shock amount on Tick 3 (UST).",
+    )
+    parser.add_argument(
+        "--shock-t6",
+        type=str,
+        default="300000",
+        help="Whale shock amount on Tick 6 (UST).",
+    )
+    parser.add_argument(
+        "--pool-a-init",
+        type=str,
+        default="10000000,10000000",
+        help="Initial Pool_A reserves as 'UST,USDC'.",
+    )
+    parser.add_argument(
+        "--retail-ust-cap",
+        type=str,
+        default="5000000",
+        help="Retail total UST cap for staircase scenario.",
+    )
+    parser.add_argument(
+        "--no-paper-charts",
+        action="store_true",
+        help="Disable automatic paper-grade chart generation after simulation.",
+    )
+    parser.add_argument(
+        "--paper-chart-formats",
+        type=str,
+        default="png,pdf",
+        help="Auto paper chart formats, comma-separated (default: png,pdf).",
+    )
+    parser.add_argument(
+        "--paper-chart-dpi",
+        type=int,
+        default=300,
+        help="Auto paper chart PNG DPI (default: 300).",
+    )
+    parser.add_argument(
+        "--paper-chart-style",
+        type=str,
+        default="whitegrid",
+        help="Auto paper chart seaborn style.",
+    )
+    parser.add_argument(
+        "--paper-chart-font-size",
+        type=int,
+        default=14,
+        help="Auto paper chart global font size.",
+    )
+    parser.add_argument(
+        "--paper-chart-congestion-scale",
+        type=str,
+        choices=("linear", "log"),
+        default="log",
+        help="Auto paper chart congestion scale.",
+    )
+    parser.add_argument(
+        "--paper-chart-strict-shape-check",
+        action="store_true",
+        help="Enable strict L-shape data check in auto paper chart generation.",
+    )
+    parser.add_argument(
+        "--paper-chart-shape-report-json",
+        type=str,
+        default=None,
+        help="Optional path for auto paper chart shape report json.",
+    )
+    parser.add_argument(
+        "--paper-chart-output-dir",
+        type=str,
+        default=None,
+        help="Optional output directory for auto paper charts; default is run output dir.",
+    )
+    parser.add_argument(
+        "--paper-chart-fail-hard",
+        action="store_true",
+        help="Fail whole run if auto paper chart generation fails.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if int(args.ticks) <= 0:
+        raise ValueError("ticks must be > 0")
     if int(args.progress_interval) <= 0:
         raise ValueError("progress_interval must be > 0")
+    if args.llm_max_concurrent is not None and int(args.llm_max_concurrent) <= 0:
+        raise ValueError("llm_max_concurrent must be > 0")
+    if int(args.ticks_per_day) <= 0:
+        raise ValueError("ticks_per_day must be > 0")
+    if int(args.voting_window_ticks) <= 0:
+        raise ValueError("voting_window_ticks must be > 0")
+    if int(args.paper_chart_dpi) <= 0:
+        raise ValueError("paper-chart-dpi must be > 0")
+    if int(args.paper_chart_font_size) <= 0:
+        raise ValueError("paper-chart-font-size must be > 0")
+
+    shock_t1 = _parse_positive_decimal(args.shock_t1, field_name="shock_t1")
+    shock_t3 = _parse_positive_decimal(args.shock_t3, field_name="shock_t3")
+    shock_t6 = _parse_positive_decimal(args.shock_t6, field_name="shock_t6")
+    retail_ust_cap = _parse_positive_decimal(args.retail_ust_cap, field_name="retail_ust_cap")
+    pool_a_reserves = _parse_pool_reserves(args.pool_a_init)
+    if args.scenario == SCENARIO_DEFAULT:
+        pool_b_reserves = pool_a_reserves
+    else:
+        pool_b_reserves = (Decimal("1000000"), Decimal("1000000"))
+
+    black_swan_schedule = _build_black_swan_schedule(
+        scenario=args.scenario,
+        enabled=not args.disable_black_swan,
+        shock_t1=shock_t1,
+        shock_t3=shock_t3,
+        shock_t6=shock_t6,
+    )
 
     log_path = Path(args.log_file)
     if not log_path.is_absolute():
@@ -696,26 +1093,76 @@ def main() -> None:
 
     logger.info("[CONFIG] output_dir=%s", str(out_dir))
     logger.info("[CONFIG] log_file=%s", str(log_path))
+    logger.info("[CONFIG] scenario=%s", args.scenario)
+    logger.info(
+        "[CONFIG] llm_max_concurrent=%s",
+        str(args.llm_max_concurrent) if args.llm_max_concurrent is not None else "config-default",
+    )
+    logger.info("[CONFIG] ticks_per_day=%d", int(args.ticks_per_day))
+    logger.info("[CONFIG] voting_window_ticks=%d", int(args.voting_window_ticks))
+    logger.info(
+        "[CONFIG] pool_a_init=(%s,%s) | pool_b_init=(%s,%s)",
+        str(pool_a_reserves[0]),
+        str(pool_a_reserves[1]),
+        str(pool_b_reserves[0]),
+        str(pool_b_reserves[1]),
+    )
+    logger.info(
+        "[CONFIG] shock schedule amounts | t1=%s | t3=%s | t6=%s",
+        str(shock_t1),
+        str(shock_t3),
+        str(shock_t6),
+    )
 
-    engine = ACE_Engine(db_path=db_path)
+    engine = ACE_Engine(
+        db_path=db_path,
+        pool_a_reserves=pool_a_reserves,
+        pool_b_reserves=pool_b_reserves,
+    )
     metrics = LoggerMetrics(metrics_csv)
     checkpoints = StateCheckpoint(checkpoint_dir)
+    governance = GovernanceModule(
+        db_path=db_path,
+        voting_window_ticks=int(args.voting_window_ticks),
+    )
 
     orchestrator = Simulation_Orchestrator(
         engine=engine,
+        ticks_per_day=int(args.ticks_per_day),
+        governance=governance,
         max_tx_per_tick=50,
         metrics_logger=metrics,
         state_checkpoint=checkpoints,
     )
 
-    agents = seed_accounts(engine, count_retail=args.retail)
-    setup_topology(orchestrator, agents)
+    bootstrap = build_bootstrap_cohort(count_retail=args.retail, logger=logger)
+    retail_cap_info = {
+        "cap": str(retail_ust_cap),
+        "total_before": None,
+        "total_after": None,
+        "scaled": False,
+        "scale_ratio": None,
+    }
+    if args.scenario == SCENARIO_DEFAULT:
+        retail_cap_info = _apply_retail_ust_cap(
+            bootstrap=bootstrap,
+            cap=retail_ust_cap,
+            logger=logger,
+        )
+    bootstrap_by_id = {item.agent_id: item for item in bootstrap}
+    role_map = {item.agent_id: item.role for item in bootstrap}
+    agents = seed_accounts(engine, bootstrap=bootstrap)
+    setup_topology(orchestrator, bootstrap=bootstrap)
 
-    runtime_agent_ids = select_runtime_agents(agents, llm_agent_count=args.llm_agent_count)
+    runtime_agent_ids = select_runtime_agents(
+        agents,
+        llm_agent_count=args.llm_agent_count,
+        role_map=role_map,
+    )
 
     if not args.offline_rules:
         logger.info("[CHECK] LLM connectivity preflight...")
-        required_roles = {role_of(agent_id) for agent_id in runtime_agent_ids}
+        required_roles = {role_of(agent_id, role_map) for agent_id in runtime_agent_ids}
         preflight_api_or_raise(
             required_roles=required_roles,
             timeout=args.preflight_timeout,
@@ -728,7 +1175,9 @@ def main() -> None:
     runtime = build_runtime(
         orchestrator,
         runtime_agent_ids=runtime_agent_ids,
+        bootstrap_by_id=bootstrap_by_id,
         offline_rules=args.offline_rules,
+        llm_max_concurrent=args.llm_max_concurrent,
     )
 
     logger.info("[RUN] simulation started")
@@ -738,22 +1187,44 @@ def main() -> None:
             orchestrator,
             runtime,
             agents=agents,
+            role_map=role_map,
             ticks=args.ticks,
             max_inbox_size=args.max_inbox_size,
             logger=logger,
             progress_enabled=not args.no_progress,
             progress_interval=int(args.progress_interval),
             offline_rules=args.offline_rules,
+            black_swan_schedule=black_swan_schedule,
+        )
+
+        curve_quality = _evaluate_curve_quality(
+            sim_stats["ust_price_by_tick"],
+            total_ticks=int(args.ticks),
         )
 
         summary = {
             "ticks": args.ticks,
             "agents": len(agents),
             "runtime_agents": len(runtime_agent_ids),
+            "scenario": args.scenario,
+            "seed": int(args.seed),
             "llm_mode": "offline_rules" if args.offline_rules else "api",
             "decision_calls_total": sim_stats["llm_calls_total"],
             "api_calls_total": sim_stats["api_calls_total"],
             "sleeping_total": sim_stats["sleeping_total"],
+            "pool_a_init": [str(pool_a_reserves[0]), str(pool_a_reserves[1])],
+            "pool_b_init": [str(pool_b_reserves[0]), str(pool_b_reserves[1])],
+            "shock_plan": {
+                "enabled": not args.disable_black_swan,
+                "ticks": sorted(list(black_swan_schedule.keys())),
+                "tick_amounts_ust": {
+                    "1": str(shock_t1),
+                    "3": str(shock_t3),
+                    "6": str(shock_t6),
+                },
+            },
+            "retail_ust_cap": retail_cap_info,
+            "curve_quality": curve_quality,
             "db": str(db_path),
             "metrics_csv": str(metrics_csv),
             "checkpoint_count": len(list(checkpoint_dir.glob("tick_*.json"))),
@@ -766,6 +1237,56 @@ def main() -> None:
         plot_path = out_dir / "phase5_dashboard.png"
         plot_metrics(metrics_csv, plot_path)
 
+        paper_chart_outputs: dict[str, Any] | None = None
+        if not args.no_paper_charts:
+            paper_chart_output_dir = (
+                Path(args.paper_chart_output_dir).resolve()
+                if args.paper_chart_output_dir
+                else out_dir
+            )
+            paper_shape_report_path = (
+                Path(args.paper_chart_shape_report_json).resolve()
+                if args.paper_chart_shape_report_json
+                else None
+            )
+            try:
+                from paper_charts_generator import generate_charts, parse_formats
+
+                paper_chart_outputs = generate_charts(
+                    metrics_path=metrics_csv,
+                    summary_path=summary_path,
+                    db_path=db_path,
+                    output_dir=paper_chart_output_dir,
+                    dpi=int(args.paper_chart_dpi),
+                    style=str(args.paper_chart_style),
+                    formats=parse_formats(str(args.paper_chart_formats)),
+                    font_size=int(args.paper_chart_font_size),
+                    congestion_scale=str(args.paper_chart_congestion_scale),
+                    strict_shape_check=bool(args.paper_chart_strict_shape_check),
+                    shape_report_json=paper_shape_report_path,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error("[RUN] auto paper chart generation failed: %s", str(exc))
+                if args.paper_chart_fail_hard:
+                    raise
+            else:
+                summary["paper_charts"] = {
+                    "output_dir": str(paper_chart_output_dir),
+                    "files": {
+                        key: (
+                            {fmt: str(path) for fmt, path in value.items()}
+                            if isinstance(value, dict)
+                            else str(value)
+                        )
+                        for key, value in paper_chart_outputs.items()
+                        if key != "diagnostics"
+                    },
+                }
+                summary_path.write_text(
+                    json.dumps(summary, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+
         logger.info("[RUN] simulation finished")
         logger.info("[RUN] mode=%s", summary["llm_mode"])
         logger.info("[RUN] decision_calls_total=%s", summary["decision_calls_total"])
@@ -775,6 +1296,11 @@ def main() -> None:
         logger.info("[RUN] checkpoints=%s", str(checkpoint_dir))
         logger.info("[RUN] plot=%s", str(plot_path))
         logger.info("[RUN] summary=%s", str(summary_path))
+        if paper_chart_outputs is not None:
+            logger.info(
+                "[RUN] paper_dashboard=%s",
+                str(paper_chart_outputs.get("dashboard", {}).get("png", "-")),
+            )
     finally:
         orchestrator.close()
         engine.close()
