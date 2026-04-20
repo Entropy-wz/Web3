@@ -7,8 +7,13 @@ import pytest
 from ace_sim.engine.ace_engine import ACE_Engine, InsufficientFundsError
 from ace_sim.execution.orchestrator.time_orchestrator import Simulation_Orchestrator
 from ace_sim.governance.compiler_agent import CompilerAgent, CompilerValidationError
-from ace_sim.governance.governance import GovernanceModule, ProposalLimitError
+from ace_sim.governance.governance import (
+    GovernanceModule,
+    ProposalLimitError,
+    ProposalMitigationError,
+)
 from ace_sim.governance.logger_metrics import LoggerMetrics
+from ace_sim.governance.mitigation import GovernanceMitigationModule, RuleBasedSemanticScorer
 
 
 def _new_stack(
@@ -20,6 +25,7 @@ def _new_stack(
     max_open_per_agent: int = 1,
     max_tx_per_tick: int = 50,
     metrics: LoggerMetrics | None = None,
+    mitigation_strategy: GovernanceMitigationModule | None = None,
 ) -> tuple[ACE_Engine, Simulation_Orchestrator]:
     db_path = tmp_path / "phase5.sqlite3"
     engine = ACE_Engine(db_path=db_path)
@@ -29,6 +35,7 @@ def _new_stack(
         voting_window_ticks=voting_window_ticks,
         max_open_proposals=max_open_proposals,
         max_open_per_agent=max_open_per_agent,
+        mitigation_strategy=mitigation_strategy,
     )
     orchestrator = Simulation_Orchestrator(
         engine=engine,
@@ -37,6 +44,21 @@ def _new_stack(
         metrics_logger=metrics,
     )
     return engine, orchestrator
+
+
+class _DeterministicScorer(RuleBasedSemanticScorer):
+    def __init__(self, mapping: dict[str, float]) -> None:
+        self.mapping = mapping
+
+    def score(
+        self,
+        *,
+        proposal_text: str,
+        proposer: str,
+        open_proposal_texts: list[str],
+    ) -> tuple[float, str]:
+        value = self.mapping.get(str(proposal_text).strip(), 0.5)
+        return float(value), "test"
 
 
 def test_governance_weight_uses_luna_snapshot_only(tmp_path):
@@ -124,6 +146,109 @@ def test_governance_dos_blocks_project_rescue_proposal(tmp_path):
             "PROPOSE",
             {"proposal_text": "Disable minting and set swap fee to 0.01"},
         )
+
+
+def test_mitigation_rejects_low_quality_placeholder(tmp_path):
+    db_path = tmp_path / "mitigation_a.sqlite3"
+    mitigation = GovernanceMitigationModule(
+        base_db_path=db_path,
+        mode="semantic",
+        semantic_scorer=_DeterministicScorer(
+            {"Update protocol logo style guidelines for social media banners.": 0.1}
+        ),
+        enable_llm_scoring=False,
+    )
+    engine, orchestrator = _new_stack(tmp_path, mitigation_strategy=mitigation)
+    engine.create_account("whale_1", luna="5000")
+
+    with pytest.raises(ProposalMitigationError, match="Spam/Placeholder"):
+        orchestrator.submit_event(
+            "whale_1",
+            "PROPOSE",
+            {"proposal_text": "Update protocol logo style guidelines for social media banners."},
+        )
+
+
+def test_mitigation_high_priority_patch_preemptive_eviction(tmp_path):
+    db_path = tmp_path / "mitigation_preempt.sqlite3"
+    score_map = {
+        "Proposal A": 0.31,
+        "Proposal B": 0.45,
+        "Proposal C": 0.52,
+        "Emergency Patch: disable minting now": 0.95,
+    }
+    mitigation = GovernanceMitigationModule(
+        base_db_path=db_path,
+        mode="semantic",
+        semantic_scorer=_DeterministicScorer(score_map),
+        enable_llm_scoring=False,
+    )
+    engine, orchestrator = _new_stack(
+        tmp_path,
+        voting_window_ticks=20,
+        max_open_proposals=3,
+        max_open_per_agent=3,
+        mitigation_strategy=mitigation,
+    )
+    engine.create_account("whale_1", luna="10000")
+    engine.create_account("project_0", luna="10000")
+
+    p1 = orchestrator.submit_event("whale_1", "PROPOSE", {"proposal_text": "Proposal A"})
+    orchestrator.submit_event("whale_1", "PROPOSE", {"proposal_text": "Proposal B"})
+    orchestrator.submit_event("whale_1", "PROPOSE", {"proposal_text": "Proposal C"})
+
+    patch_id = orchestrator.submit_event(
+        "project_0",
+        "PROPOSE",
+        {"proposal_text": "Emergency Patch: disable minting now"},
+    )
+
+    state = orchestrator.governance.get_state()
+    status_by_id = {
+        item["proposal_id"]: item["status"] for item in state["proposals"]
+    }
+    open_count = sum(1 for item in state["proposals"] if item["status"] == "open")
+
+    assert open_count == 3
+    assert status_by_id[p1] == "REJECTED_BY_MITIGATION"
+    assert status_by_id[patch_id] == "open"
+
+
+def test_mitigation_eviction_does_not_refund_proposal_fee(tmp_path):
+    db_path = tmp_path / "mitigation_fee.sqlite3"
+    score_map = {
+        "Proposal A": 0.31,
+        "Proposal B": 0.45,
+        "Proposal C": 0.52,
+        "Emergency Patch: disable minting now": 0.95,
+    }
+    mitigation = GovernanceMitigationModule(
+        base_db_path=db_path,
+        mode="semantic",
+        semantic_scorer=_DeterministicScorer(score_map),
+        enable_llm_scoring=False,
+    )
+    engine, orchestrator = _new_stack(
+        tmp_path,
+        voting_window_ticks=20,
+        max_open_proposals=3,
+        max_open_per_agent=3,
+        mitigation_strategy=mitigation,
+    )
+    engine.create_account("whale_1", luna="10000")
+    engine.create_account("project_0", luna="10000")
+
+    orchestrator.submit_event("whale_1", "PROPOSE", {"proposal_text": "Proposal A"})
+    orchestrator.submit_event("whale_1", "PROPOSE", {"proposal_text": "Proposal B"})
+    orchestrator.submit_event("whale_1", "PROPOSE", {"proposal_text": "Proposal C"})
+    orchestrator.submit_event(
+        "project_0",
+        "PROPOSE",
+        {"proposal_text": "Emergency Patch: disable minting now"},
+    )
+
+    # 4 accepted proposals => fee vault retains all proposal fees, evicted proposal is not refunded.
+    assert engine.fee_vault["LUNA"] == Decimal("4000")
 
 
 def test_settlement_rules_quorum_and_majority(tmp_path):

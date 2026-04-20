@@ -6,10 +6,20 @@ from .governance import (
     GovernanceSettlement,
     GovernanceUpdate,
     ProposalLimitError,
+    ProposalMitigationError,
     ProposalNotFoundError,
     ProposalStateError,
 )
 from .logger_metrics import LoggerMetrics, TickMetrics
+from .mitigation import (
+    BaseGovernanceFilter,
+    ExistingProposalState,
+    FastLLMHybridScorer,
+    GovernanceMitigationModule,
+    MitigationDecision,
+    MitigationProposalData,
+    RuleBasedSemanticScorer,
+)
 from .state_checkpoint import StateCheckpoint
 
 __all__ = [
@@ -21,8 +31,16 @@ __all__ = [
     "GovernanceApplyResult",
     "GovernanceError",
     "ProposalLimitError",
+    "ProposalMitigationError",
     "ProposalNotFoundError",
     "ProposalStateError",
+    "BaseGovernanceFilter",
+    "ExistingProposalState",
+    "FastLLMHybridScorer",
+    "GovernanceMitigationModule",
+    "MitigationDecision",
+    "MitigationProposalData",
+    "RuleBasedSemanticScorer",
     "LoggerMetrics",
     "TickMetrics",
     "StateCheckpoint",

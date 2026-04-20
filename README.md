@@ -1,7 +1,7 @@
 ﻿# ACE-Sim: Web3 多智能体经济与治理安全仿真平台
 
 ![python](https://img.shields.io/badge/Python-3.10%2B-blue)
-![tests](https://img.shields.io/badge/Tests-66%20Passing-brightgreen)
+![tests](https://img.shields.io/badge/Tests-69%20Passing-brightgreen)
 ![phase](https://img.shields.io/badge/Phase-1~5-success)
 ![llm](https://img.shields.io/badge/LLM-API%20Default-orange)
 
@@ -153,6 +153,11 @@ python scripts/visualization/phase5_governance_visualizer.py --ticks 80 --retail
 python scripts/visualization/phase5_governance_visualizer.py --ticks 80 --retail 24 --scenario staircase_formal_run --governance-dos-attack --dos-whale-luna 4000 --dos-sell-ust 300000 --output-dir artifacts/gov_dos_attack
 ```
 
+### 6.9 防御 A（语义治理网关，SAGG）（可选）
+```bash
+python scripts/visualization/phase5_governance_visualizer.py --ticks 40 --retail 24 --scenario staircase_formal_run --governance-dos-attack --mitigation-mode semantic --output-dir artifacts/sagg40_demo --no-paper-charts
+```
+
 ## 7. 日志与可观测性（Phase 5 增强）
 所有日志统一写入终端 + 文件（默认 `logs/simulation_run.log`）。
 
@@ -181,6 +186,7 @@ python scripts/visualization/phase5_governance_visualizer.py --ticks 80 --retail
 5. `artifacts/phase5/paper_dashboard_2x2.(png|pdf)`
 6. `artifacts/phase5/chart1~chart4.(png|pdf)`
 7. `artifacts/phase5/shape_report.json`
+8. `paper/防御A治理效果.md`（防御A实验结果汇总表）
 
 ### 8.3 Git 备份注意事项（小补充）
 1. 默认不会把 `artifacts` 下的大体量实验产物提交到 Git。

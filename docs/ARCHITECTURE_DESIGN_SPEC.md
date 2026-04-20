@@ -75,6 +75,7 @@ ACE-Sim 采用五层架构：
    3. 单地址活跃提案上限
 4. 通过后先编译成受限参数补丁，再在下一 Tick 生效。
 5. 白名单参数更新，禁止越权修改。
+6. 可插拔治理防御中台（Mitigation Layer）：提案写库前可接入语义过滤、优先级识别、抢占式入队策略。
 
 ## 4. 日志与可观测架构（Phase 5 增强）
 路径：`scripts/visualization/phase5_governance_visualizer.py`
@@ -143,7 +144,7 @@ ACE-Sim 采用五层架构：
 1. `ACE_Engine`：`minting_allowed`、`swap_fee`、`daily_mint_cap`。
 2. `Simulation_Orchestrator`：`ticks_per_day`、`max_tx_per_tick`、`default_max_inbox_size`。
 3. `GovernanceModule`：`proposal_fee_luna`、`max_open_proposals`、`max_open_per_agent`、`voting_window_ticks`、`quorum_ratio`。
-4. Phase 5 脚本参数：`--scenario`、`--pool-a-init`、`--shock-t1/--shock-t3/--shock-t6`、`--retail-ust-cap`、`--social-eclipse-attack`、`--governance-dos-attack`、`--ticks-per-day`、`--voting-window-ticks`、`--llm-max-concurrent`、`--no-progress`、`--progress-interval`、`--log-file`、`--log-level`。
+4. Phase 5 脚本参数：`--scenario`、`--pool-a-init`、`--shock-t1/--shock-t3/--shock-t6`、`--retail-ust-cap`、`--social-eclipse-attack`、`--governance-dos-attack`、`--enable-mitigation-a`、`--mitigation-mode`、`--ticks-per-day`、`--voting-window-ticks`、`--llm-max-concurrent`、`--no-progress`、`--progress-interval`、`--log-file`、`--log-level`。
 
 ## 6. 运行与复现实验
 说明：
@@ -206,6 +207,11 @@ python scripts/visualization/phase5_governance_visualizer.py --ticks 80 --retail
 ### 6.9 治理 DoS 占坑攻击（补充）
 ```bash
 python scripts/visualization/phase5_governance_visualizer.py --ticks 80 --retail 24 --scenario staircase_formal_run --governance-dos-attack --dos-whale-luna 4000 --dos-sell-ust 300000 --output-dir artifacts/gov_dos_attack
+```
+
+### 6.10 防御A（SAGG）实验（补充）
+```bash
+python scripts/visualization/phase5_governance_visualizer.py --ticks 40 --retail 24 --scenario staircase_formal_run --governance-dos-attack --mitigation-mode semantic --output-dir artifacts/sagg40_demo --no-paper-charts
 ```
 
 ## 7. 数据存储与结果落盘

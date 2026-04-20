@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -11,6 +12,12 @@ from uuid import uuid4
 
 from ..engine.ace_engine import ACE_Engine, InsufficientFundsError
 from .compiler_agent import CompilerAgent, CompilerValidationError
+from .mitigation import (
+    ExistingProposalState,
+    GovernanceMitigationModule,
+    MitigationDecision,
+    MitigationProposalData,
+)
 
 
 class GovernanceError(Exception):
@@ -27,6 +34,10 @@ class ProposalNotFoundError(GovernanceError):
 
 class ProposalStateError(GovernanceError):
     """Raised when a proposal is not in a votable/settleable state."""
+
+
+class ProposalMitigationError(GovernanceError):
+    """Raised when proposal is rejected by mitigation filters."""
 
 
 @dataclass
@@ -116,8 +127,11 @@ class GovernanceModule:
         max_open_per_agent: int = 1,
         voting_window_ticks: int = 20,
         quorum_ratio: Any = "0.3",
+        mitigation_strategy: GovernanceMitigationModule | None = None,
     ) -> None:
         self.compiler_agent = compiler_agent or CompilerAgent()
+        self.mitigation_strategy = mitigation_strategy
+        self.logger = logging.getLogger("ace_sim.governance")
 
         self.proposal_fee_luna = Decimal(str(proposal_fee_luna))
         self.max_open_proposals = int(max_open_proposals)
@@ -147,6 +161,8 @@ class GovernanceModule:
         self._init_tables()
 
     def close(self) -> None:
+        if self.mitigation_strategy is not None:
+            self.mitigation_strategy.close()
         if getattr(self, "_conn", None) is not None:
             self._conn.close()
             self._conn = None
@@ -166,7 +182,40 @@ class GovernanceModule:
         if not proposal_text:
             raise GovernanceError("proposal text cannot be empty")
 
+        proposal_id = str(uuid4())
         open_props = [p for p in self._proposals.values() if p.status == "open"]
+        mitigation_decision: MitigationDecision | None = None
+        if self.mitigation_strategy is not None:
+            mitigation_decision = self.mitigation_strategy.pre_check_proposal(
+                proposal_data=MitigationProposalData(
+                    proposal_id=proposal_id,
+                    proposer=proposer,
+                    proposal_text=proposal_text,
+                    current_tick=int(current_tick),
+                ),
+                open_proposals=[
+                    ExistingProposalState(
+                        proposal_id=item.proposal_id,
+                        proposer=item.proposer,
+                        text=item.text,
+                        status=item.status,
+                    )
+                    for item in open_props
+                ],
+                max_open_proposals=self.max_open_proposals,
+            )
+            if not mitigation_decision.allow:
+                raise ProposalMitigationError(
+                    mitigation_decision.reject_reason or "proposal rejected by mitigation"
+                )
+            if mitigation_decision.evict_proposal_id is not None:
+                self._evict_open_proposal_by_mitigation(
+                    proposal_id=mitigation_decision.evict_proposal_id,
+                    by_proposer=proposer,
+                    current_tick=int(current_tick),
+                )
+                open_props = [p for p in self._proposals.values() if p.status == "open"]
+
         if len(open_props) >= self.max_open_proposals:
             raise ProposalLimitError(
                 f"open proposal limit reached: {self.max_open_proposals}"
@@ -188,7 +237,6 @@ class GovernanceModule:
                 f"required={self.proposal_fee_luna}"
             )
 
-        proposal_id = str(uuid4())
         engine.charge_fee(
             address=proposer,
             token="LUNA",
@@ -215,6 +263,13 @@ class GovernanceModule:
         )
         self._proposals[proposal_id] = proposal
         self._write_proposal(proposal)
+        if self.mitigation_strategy is not None and mitigation_decision is not None:
+            self.mitigation_strategy.on_proposal_accepted(
+                proposal_id=proposal_id,
+                proposer=proposer,
+                proposal_text=proposal_text,
+                decision=mitigation_decision,
+            )
         return proposal_id
 
     def submit_vote(
@@ -470,6 +525,35 @@ class GovernanceModule:
             return None
         except Exception:  # noqa: BLE001
             return None
+
+    def _evict_open_proposal_by_mitigation(
+        self,
+        *,
+        proposal_id: str,
+        by_proposer: str,
+        current_tick: int,
+    ) -> None:
+        target = self._proposals.get(str(proposal_id))
+        if target is None or target.status != "open":
+            return
+        target.status = "REJECTED_BY_MITIGATION"
+        target.settled_tick = int(current_tick)
+        self._update_proposal_status(
+            proposal_id=target.proposal_id,
+            status=target.status,
+            settled_tick=target.settled_tick,
+        )
+        if self.mitigation_strategy is not None:
+            self.mitigation_strategy.on_proposal_evicted(
+                proposal_id=target.proposal_id,
+                current_tick=int(current_tick),
+            )
+        self.logger.info(
+            "[PROPOSAL-EVICTION] evicted=%s by=%s tick=%d",
+            target.proposal_id,
+            by_proposer,
+            int(current_tick),
+        )
 
     def get_state(self) -> dict[str, Any]:
         open_count = sum(1 for p in self._proposals.values() if p.status == "open")
@@ -790,6 +874,7 @@ __all__ = [
     "GovernanceApplyResult",
     "GovernanceError",
     "ProposalLimitError",
+    "ProposalMitigationError",
     "ProposalNotFoundError",
     "ProposalStateError",
 ]

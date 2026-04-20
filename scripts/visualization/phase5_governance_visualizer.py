@@ -33,6 +33,7 @@ from ace_sim.engine.ace_engine import ACE_Engine
 from ace_sim.execution.orchestrator.time_orchestrator import TickSettlementReport
 from ace_sim.execution.orchestrator.time_orchestrator import Simulation_Orchestrator
 from ace_sim.governance.governance import GovernanceModule, ProposalLimitError
+from ace_sim.governance.mitigation import GovernanceMitigationModule
 from ace_sim.governance.logger_metrics import LoggerMetrics
 from ace_sim.governance.state_checkpoint import StateCheckpoint
 from ace_sim.runtime.agent_runtime import AgentRuntime
@@ -1501,6 +1502,18 @@ def parse_args() -> argparse.Namespace:
         help="Retail total UST cap for staircase scenario.",
     )
     parser.add_argument(
+        "--enable-mitigation-a",
+        action="store_true",
+        help="Enable Semantic-Aware Governance Gateway (SAGG) mitigation.",
+    )
+    parser.add_argument(
+        "--mitigation-mode",
+        type=str,
+        choices=("none", "semantic", "priority", "full"),
+        default="none",
+        help="Governance mitigation mode. If not none, it overrides --enable-mitigation-a.",
+    )
+    parser.add_argument(
         "--social-eclipse-attack",
         action="store_true",
         help="Enable social-driven mempool eclipse attack (FUD + sell pressure).",
@@ -1709,6 +1722,15 @@ def main() -> None:
         "[CONFIG] governance_dos_attack=%s",
         "on" if args.governance_dos_attack else "off",
     )
+    resolved_mitigation_mode = (
+        str(args.mitigation_mode).strip().lower()
+        if str(args.mitigation_mode).strip().lower() != "none"
+        else ("semantic" if args.enable_mitigation_a else "none")
+    )
+    logger.info(
+        "[CONFIG] mitigation_mode=%s",
+        resolved_mitigation_mode,
+    )
     logger.info(
         "[CONFIG] social_eclipse_attack=%s",
         "on" if args.social_eclipse_attack else "off",
@@ -1739,10 +1761,21 @@ def main() -> None:
     metrics = LoggerMetrics(metrics_csv)
     checkpoints = StateCheckpoint(checkpoint_dir)
     governance_max_open_per_agent = 3 if args.governance_dos_attack else 1
+    mitigation_strategy = (
+        GovernanceMitigationModule.from_mode(
+            base_db_path=db_path,
+            mode=resolved_mitigation_mode,
+            enable_llm_scoring=not bool(args.offline_rules),
+            llm_timeout=4.0,
+        )
+        if resolved_mitigation_mode != "none"
+        else None
+    )
     governance = GovernanceModule(
         db_path=db_path,
         voting_window_ticks=int(args.voting_window_ticks),
         max_open_per_agent=governance_max_open_per_agent,
+        mitigation_strategy=mitigation_strategy,
     )
 
     orchestrator = Simulation_Orchestrator(
@@ -1878,6 +1911,7 @@ def main() -> None:
             "retail_ust_cap": retail_cap_info,
             "prompt_profile": prompt_profile_report,
             "social_eclipse_prompt_bias_applied": bool(eclipse_prompt_bias_applied),
+            "mitigation_mode": resolved_mitigation_mode,
             "curve_quality": curve_quality,
             "governance_dos": sim_stats.get("governance_dos", {}),
             "social_eclipse": sim_stats.get("social_eclipse", {}),

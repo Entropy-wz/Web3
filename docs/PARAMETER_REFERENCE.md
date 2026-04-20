@@ -69,6 +69,7 @@
 | `max_open_per_agent` | `int>0`（默认 `1`） | 单地址同时 open 提案上限。 |
 | `voting_window_ticks` | `int>0`（默认 `20`） | 投票窗口长度。 |
 | `quorum_ratio` | `Decimal`，范围 `[0,1]`（默认 `0.3`） | 法定参与率门槛。 |
+| `mitigation_strategy` | `GovernanceMitigationModule` 或 `None`（默认 `None`） | 可插拔治理防御中台（提案写库前过滤）。 |
 
 ### 4.1 治理白名单参数（NLP-to-DSL 可改）
 
@@ -190,6 +191,8 @@
 | `--scenario` | `default` 或 `staircase_formal_run`（默认 `staircase_formal_run`） | 选择实验场景预设。 |
 | `--seed` | `int`（默认 `42`） | 随机种子。 |
 | `--output-dir` | 路径（默认 `artifacts/phase5`） | 产物输出目录。 |
+| `--enable-mitigation-a` | 开关（默认关闭） | 启用防御A语义治理网关（快捷开关）。 |
+| `--mitigation-mode` | `none/semantic/priority/full`（默认 `none`） | 治理防御模式；非 `none` 时优先生效。 |
 | `--prompt-profile-path` | JSON 路径或空 | 指定角色画像覆盖文件（常用于攻击实验）。 |
 | `--offline-rules` | 开关（默认关闭） | 启用离线规则模式（不走 API）。 |
 | `--llm-agent-count` | `int`（默认 `12`） | 由运行时控制的 agent 数量。 |
