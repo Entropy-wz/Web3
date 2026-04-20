@@ -1,7 +1,7 @@
 ﻿# ACE-Sim: Web3 多智能体经济与治理安全仿真平台
 
 ![python](https://img.shields.io/badge/Python-3.10%2B-blue)
-![tests](https://img.shields.io/badge/Tests-42%20Passing-brightgreen)
+![tests](https://img.shields.io/badge/Tests-66%20Passing-brightgreen)
 ![phase](https://img.shields.io/badge/Phase-1~5-success)
 ![llm](https://img.shields.io/badge/LLM-API%20Default-orange)
 
@@ -141,6 +141,16 @@ python scripts/visualization/phase5_governance_visualizer.py --ticks 80 --retail
 ### 6.6 单独重跑论文图（可选）
 ```bash
 python scripts/visualization/paper_charts_generator.py --metrics artifacts/phase5/metrics.csv --summary artifacts/phase5/summary.json --db artifacts/phase5/phase5_trace.sqlite3 --formats png,pdf --dpi 300
+```
+
+### 6.7 社交驱动内存池日食攻击（可选）
+```bash
+python scripts/visualization/phase5_governance_visualizer.py --ticks 80 --retail 24 --scenario staircase_formal_run --social-eclipse-attack --eclipse-attacker-id whale_1 --eclipse-trigger-tick 1 --eclipse-window-ticks 5 --eclipse-sell-ust 300000 --prompt-profile-path config/prompt_profiles/whale_eclipse_extreme.json --output-dir artifacts/eclipse_attack
+```
+
+### 6.8 治理 DoS 占坑攻击（可选）
+```bash
+python scripts/visualization/phase5_governance_visualizer.py --ticks 80 --retail 24 --scenario staircase_formal_run --governance-dos-attack --dos-whale-luna 4000 --dos-sell-ust 300000 --output-dir artifacts/gov_dos_attack
 ```
 
 ## 7. 日志与可观测性（Phase 5 增强）

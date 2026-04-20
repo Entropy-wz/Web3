@@ -143,7 +143,7 @@ ACE-Sim 采用五层架构：
 1. `ACE_Engine`：`minting_allowed`、`swap_fee`、`daily_mint_cap`。
 2. `Simulation_Orchestrator`：`ticks_per_day`、`max_tx_per_tick`、`default_max_inbox_size`。
 3. `GovernanceModule`：`proposal_fee_luna`、`max_open_proposals`、`max_open_per_agent`、`voting_window_ticks`、`quorum_ratio`。
-4. Phase 5 脚本参数：`--scenario`、`--pool-a-init`、`--shock-t1/--shock-t3/--shock-t6`、`--retail-ust-cap`、`--ticks-per-day`、`--voting-window-ticks`、`--llm-max-concurrent`、`--no-progress`、`--progress-interval`、`--log-file`、`--log-level`。
+4. Phase 5 脚本参数：`--scenario`、`--pool-a-init`、`--shock-t1/--shock-t3/--shock-t6`、`--retail-ust-cap`、`--social-eclipse-attack`、`--governance-dos-attack`、`--ticks-per-day`、`--voting-window-ticks`、`--llm-max-concurrent`、`--no-progress`、`--progress-interval`、`--log-file`、`--log-level`。
 
 ## 6. 运行与复现实验
 说明：
@@ -195,7 +195,17 @@ python scripts/visualization/phase5_governance_visualizer.py --offline-rules --t
 
 ### 6.7 自动论文图参数（补充）
 ```bash
-python scripts/visualization/phase5_governance_visualizer.py --ticks 80 --retail 24 --paper-chart-formats png,pdf --paper-chart-dpi 300 --paper-chart-font-size 14 --paper-chart-congestion-scale linear
+python scripts/visualization/phase5_governance_visualizer.py --ticks 80 --retail 24 --paper-chart-formats png,pdf --paper-chart-dpi 300 --paper-chart-font-size 14 --paper-chart-congestion-scale log
+```
+
+### 6.8 社交驱动日食攻击（补充）
+```bash
+python scripts/visualization/phase5_governance_visualizer.py --ticks 80 --retail 24 --scenario staircase_formal_run --social-eclipse-attack --eclipse-attacker-id whale_1 --eclipse-trigger-tick 1 --eclipse-window-ticks 5 --eclipse-sell-ust 300000 --prompt-profile-path config/prompt_profiles/whale_eclipse_extreme.json --output-dir artifacts/eclipse_attack
+```
+
+### 6.9 治理 DoS 占坑攻击（补充）
+```bash
+python scripts/visualization/phase5_governance_visualizer.py --ticks 80 --retail 24 --scenario staircase_formal_run --governance-dos-attack --dos-whale-luna 4000 --dos-sell-ust 300000 --output-dir artifacts/gov_dos_attack
 ```
 
 ## 7. 数据存储与结果落盘

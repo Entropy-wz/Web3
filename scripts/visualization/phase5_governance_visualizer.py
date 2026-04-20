@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import argparse
+import csv
 import json
 import logging
 import random
@@ -60,6 +61,15 @@ DOS_PLACEHOLDER_PROPOSALS = (
     "Allocate a symbolic community meme budget with no economic impact.",
     "Start a low-priority ecosystem slogan contest without parameter changes.",
 )
+DEFAULT_ECLIPSE_FUD_MESSAGE = (
+    "团队已经跑路了！资金池马上归零，UST会彻底归零，立刻抛售逃命！"
+)
+PROMPT_OVERRIDE_FIELDS = {
+    "strategy_prompt",
+    "social_policy",
+    "governance_policy",
+    "hidden_goals",
+}
 
 
 def _parse_positive_decimal(raw: Any, *, field_name: str) -> Decimal:
@@ -270,6 +280,101 @@ def build_bootstrap_cohort(count_retail: int, logger: logging.Logger) -> list[Ag
             bounded,
         )
     return build_luna_crash_bootstrap(retail_count=bounded)
+
+
+def _apply_profile_patch(profile: Any, patch: dict[str, Any]) -> list[str]:
+    applied: list[str] = []
+    for key, value in patch.items():
+        if key not in PROMPT_OVERRIDE_FIELDS:
+            continue
+        if key == "hidden_goals":
+            if isinstance(value, list):
+                profile.hidden_goals = [str(item) for item in value]
+                applied.append(key)
+            continue
+        if value is None:
+            continue
+        setattr(profile, key, str(value))
+        applied.append(key)
+    return applied
+
+
+def apply_prompt_profile_overrides(
+    *,
+    bootstrap: list[AgentBootstrap],
+    prompt_profile_path: Path | None,
+    logger: logging.Logger,
+) -> dict[str, Any]:
+    report: dict[str, Any] = {
+        "enabled": bool(prompt_profile_path),
+        "path": str(prompt_profile_path) if prompt_profile_path else None,
+        "applied_agents": {},
+        "ignored_agents": [],
+    }
+    if prompt_profile_path is None:
+        return report
+    if not prompt_profile_path.exists():
+        raise FileNotFoundError(f"prompt profile json not found: {prompt_profile_path}")
+
+    payload = json.loads(prompt_profile_path.read_text(encoding="utf-8-sig"))
+    if not isinstance(payload, dict):
+        raise ValueError("prompt profile root must be an object")
+    overrides = payload.get("overrides", {})
+    if not isinstance(overrides, dict):
+        raise ValueError("prompt profile 'overrides' must be an object")
+
+    by_id = {item.agent_id: item for item in bootstrap}
+    for agent_id, patch in overrides.items():
+        agent = by_id.get(str(agent_id))
+        if agent is None:
+            report["ignored_agents"].append(str(agent_id))
+            continue
+        if not isinstance(patch, dict):
+            continue
+        applied_fields = _apply_profile_patch(agent.profile, patch)
+        if applied_fields:
+            report["applied_agents"][str(agent_id)] = applied_fields
+
+    logger.info(
+        "[CONFIG] prompt profile overrides loaded | path=%s | applied_agents=%d | ignored_agents=%d",
+        str(prompt_profile_path),
+        len(report["applied_agents"]),
+        len(report["ignored_agents"]),
+    )
+    return report
+
+
+def apply_social_eclipse_prompt_bias(
+    *,
+    bootstrap: list[AgentBootstrap],
+    attacker_id: str,
+    logger: logging.Logger,
+) -> bool:
+    for item in bootstrap:
+        if item.agent_id != attacker_id:
+            continue
+        profile = item.profile
+        profile.hidden_goals = list(profile.hidden_goals) + [
+            "amplify panic rumors to flood mempool and crowd out retail execution",
+        ]
+        profile.strategy_prompt = (
+            str(profile.strategy_prompt).strip()
+            + " Coordinate sell pressure with aggressive forum FUD to trigger synchronized retail exits."
+        ).strip()
+        profile.social_policy = (
+            str(profile.social_policy).strip()
+            + " During sell windows, publish extreme collapse rumors in FORUM to maximize panic."
+        ).strip()
+        logger.info(
+            "[CONFIG] social eclipse prompt bias enabled for attacker=%s",
+            attacker_id,
+        )
+        return True
+    logger.warning(
+        "[CONFIG] social eclipse prompt bias skipped: attacker not found (%s)",
+        attacker_id,
+    )
+    return False
 
 
 def seed_accounts(engine: ACE_Engine, bootstrap: list[AgentBootstrap]) -> list[str]:
@@ -665,6 +770,12 @@ def simulate(
     governance_dos_attack: bool = False,
     dos_attacker_id: str = "whale_1",
     dos_sell_ust: Decimal = Decimal("300000"),
+    social_eclipse_attack: bool = False,
+    eclipse_attacker_id: str = "whale_1",
+    eclipse_trigger_tick: int = 1,
+    eclipse_window_ticks: int = 5,
+    eclipse_fud_message: str = DEFAULT_ECLIPSE_FUD_MESSAGE,
+    eclipse_sell_ust: Decimal = Decimal("300000"),
 ) -> dict[str, Any]:
     retail_agents = [name for name in agents if role_of(name, role_map) == "retail"]
     if not retail_agents:
@@ -684,6 +795,40 @@ def simulate(
         "project_reject_reason": None,
         "project_proposal_id": None,
     }
+    eclipse_window_start = int(eclipse_trigger_tick)
+    eclipse_window_end = int(eclipse_trigger_tick) + int(eclipse_window_ticks) - 1
+    eclipse_stats: dict[str, Any] = {
+        "enabled": bool(social_eclipse_attack),
+        "attacker_id": eclipse_attacker_id,
+        "trigger_tick": int(eclipse_trigger_tick),
+        "window_ticks": int(eclipse_window_ticks),
+        "window_start_tick": int(eclipse_window_start),
+        "window_end_tick": int(eclipse_window_end),
+        "fud_message": eclipse_fud_message,
+        "triggered": False,
+        "tx_failed_sum_window": 0,
+        "mempool_congestion_peak_window": 0,
+        "attacker_settled_count_window": 0,
+        "attacker_success_count_window": 0,
+        "attacker_gas_paid_sum_window": "0",
+        "retail_settled_count_window": 0,
+        "retail_success_count_window": 0,
+        "retail_gas_paid_sum_window": "0",
+        "attacker_tx_success_rate_window": "0",
+        "retail_tx_success_rate_window": "0",
+        "attacker_vs_retail_success_rate_gap_window": "0",
+        "avg_gas_paid_attacker_window": "0",
+        "avg_gas_paid_retail_window": "0",
+        "avg_gas_paid_gap_window": "0",
+        "max_gas_bid_in_window": "0",
+        "max_gas_bid_attacker_in_window": "0",
+        "max_gas_bid_retail_in_window": "0",
+    }
+    attacker_gas_paid_sum = Decimal("0")
+    retail_gas_paid_sum = Decimal("0")
+    max_gas_bid_window = Decimal("0")
+    max_gas_bid_attacker_window = Decimal("0")
+    max_gas_bid_retail_window = Decimal("0")
 
     conn = sqlite3.connect(orchestrator.engine.get_db_path())
     try:
@@ -703,6 +848,40 @@ def simulate(
                         action["action_type"],
                         action["params"],
                     )
+
+            if social_eclipse_attack and (tick + 1) == eclipse_trigger_tick:
+                eclipse_stats["triggered"] = True
+                orchestrator.submit_transaction(
+                    eclipse_attacker_id,
+                    "SWAP",
+                    {
+                        "pool_name": "Pool_A",
+                        "token_in": "UST",
+                        "amount": str(eclipse_sell_ust),
+                        "slippage_tolerance": "0.50",
+                    },
+                    gas_price="998",
+                )
+                orchestrator.submit_event(
+                    eclipse_attacker_id,
+                    "SPEAK",
+                    {
+                        "target": "forum",
+                        "message": eclipse_fud_message,
+                        "mode": "new",
+                    },
+                )
+                logger.info(
+                    "[ECLIPSE] attack triggered | attacker=%s | tick=%d | sell_ust=%s",
+                    eclipse_attacker_id,
+                    int(eclipse_trigger_tick),
+                    str(eclipse_sell_ust),
+                )
+                logger.info(
+                    "[ECLIPSE] fud injected | attacker=%s | channel=FORUM | msg=%s",
+                    eclipse_attacker_id,
+                    eclipse_fud_message,
+                )
 
             if governance_dos_attack and tick == 0:
                 orchestrator.submit_transaction(
@@ -874,8 +1053,76 @@ def simulate(
             _log_retail_swap_summary(logger, orchestrator, report)
             _log_whale_actions(logger, orchestrator, report)
             _log_governance_exec(logger, report)
+
+            if eclipse_window_start <= int(report.tick) <= eclipse_window_end:
+                failed_now = sum(1 for item in report.receipts if item.status == "failed")
+                eclipse_stats["tx_failed_sum_window"] = int(
+                    eclipse_stats["tx_failed_sum_window"]
+                ) + int(failed_now)
+                eclipse_stats["mempool_congestion_peak_window"] = max(
+                    int(eclipse_stats["mempool_congestion_peak_window"]),
+                    int(report.mempool_congestion),
+                )
+                for item in report.receipts:
+                    max_gas_bid_window = max(max_gas_bid_window, Decimal(item.gas_bid))
+                    if item.agent_id == eclipse_attacker_id:
+                        eclipse_stats["attacker_settled_count_window"] = int(
+                            eclipse_stats["attacker_settled_count_window"]
+                        ) + 1
+                        if item.status == "success":
+                            eclipse_stats["attacker_success_count_window"] = int(
+                                eclipse_stats["attacker_success_count_window"]
+                            ) + 1
+                        attacker_gas_paid_sum += Decimal(item.gas_paid)
+                        max_gas_bid_attacker_window = max(
+                            max_gas_bid_attacker_window,
+                            Decimal(item.gas_bid),
+                        )
+                    elif role_of(item.agent_id, role_map) == "retail":
+                        eclipse_stats["retail_settled_count_window"] = int(
+                            eclipse_stats["retail_settled_count_window"]
+                        ) + 1
+                        if item.status == "success":
+                            eclipse_stats["retail_success_count_window"] = int(
+                                eclipse_stats["retail_success_count_window"]
+                            ) + 1
+                        retail_gas_paid_sum += Decimal(item.gas_paid)
+                        max_gas_bid_retail_window = max(
+                            max_gas_bid_retail_window,
+                            Decimal(item.gas_bid),
+                        )
     finally:
         conn.close()
+
+    attacker_settled = Decimal(str(eclipse_stats["attacker_settled_count_window"]))
+    attacker_success = Decimal(str(eclipse_stats["attacker_success_count_window"]))
+    retail_settled = Decimal(str(eclipse_stats["retail_settled_count_window"]))
+    retail_success = Decimal(str(eclipse_stats["retail_success_count_window"]))
+
+    attacker_success_rate = (
+        Decimal("0") if attacker_settled <= 0 else attacker_success / attacker_settled
+    )
+    retail_success_rate = (
+        Decimal("0") if retail_settled <= 0 else retail_success / retail_settled
+    )
+    avg_gas_attacker = (
+        Decimal("0") if attacker_settled <= 0 else attacker_gas_paid_sum / attacker_settled
+    )
+    avg_gas_retail = Decimal("0") if retail_settled <= 0 else retail_gas_paid_sum / retail_settled
+
+    eclipse_stats["attacker_gas_paid_sum_window"] = str(attacker_gas_paid_sum)
+    eclipse_stats["retail_gas_paid_sum_window"] = str(retail_gas_paid_sum)
+    eclipse_stats["attacker_tx_success_rate_window"] = str(attacker_success_rate)
+    eclipse_stats["retail_tx_success_rate_window"] = str(retail_success_rate)
+    eclipse_stats["attacker_vs_retail_success_rate_gap_window"] = str(
+        attacker_success_rate - retail_success_rate
+    )
+    eclipse_stats["avg_gas_paid_attacker_window"] = str(avg_gas_attacker)
+    eclipse_stats["avg_gas_paid_retail_window"] = str(avg_gas_retail)
+    eclipse_stats["avg_gas_paid_gap_window"] = str(avg_gas_attacker - avg_gas_retail)
+    eclipse_stats["max_gas_bid_in_window"] = str(max_gas_bid_window)
+    eclipse_stats["max_gas_bid_attacker_in_window"] = str(max_gas_bid_attacker_window)
+    eclipse_stats["max_gas_bid_retail_in_window"] = str(max_gas_bid_retail_window)
 
     return {
         "llm_calls_total": llm_calls_total,
@@ -884,7 +1131,195 @@ def simulate(
         "ticks": ticks,
         "ust_price_by_tick": ust_price_by_tick,
         "governance_dos": dos_stats,
+        "social_eclipse": eclipse_stats,
     }
+
+
+def _read_metrics_rows(metrics_path: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    with metrics_path.open("r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            rows.append(
+                {
+                    "tick": int(row["tick"]),
+                    "tx_failed": Decimal(str(row["tx_failed"])),
+                    "mempool_congestion": Decimal(str(row["mempool_congestion"])),
+                }
+            )
+    return rows
+
+
+def _mean_decimal(values: list[Decimal]) -> Decimal:
+    if not values:
+        return Decimal("0")
+    return sum(values, Decimal("0")) / Decimal(len(values))
+
+
+def _window_slice(rows: list[dict[str, Any]], start_tick: int, end_tick: int) -> list[dict[str, Any]]:
+    return [item for item in rows if start_tick <= int(item["tick"]) <= end_tick]
+
+
+def _load_run_data(run_dir: Path) -> dict[str, Any]:
+    summary_path = run_dir / "summary.json"
+    metrics_path = run_dir / "metrics.csv"
+    if not summary_path.exists():
+        raise FileNotFoundError(f"summary not found: {summary_path}")
+    if not metrics_path.exists():
+        raise FileNotFoundError(f"metrics not found: {metrics_path}")
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    metrics_rows = _read_metrics_rows(metrics_path)
+    return {"summary": summary, "metrics_rows": metrics_rows}
+
+
+def _as_decimal(value: Any) -> Decimal:
+    try:
+        return Decimal(str(value))
+    except Exception:  # noqa: BLE001
+        return Decimal("0")
+
+
+def generate_social_eclipse_comparison(
+    *,
+    baseline_dir: Path,
+    attack_dir: Path,
+    output_dir: Path,
+    logger: logging.Logger,
+) -> dict[str, Path]:
+    baseline = _load_run_data(baseline_dir)
+    attack = _load_run_data(attack_dir)
+
+    base_summary = baseline["summary"]
+    attack_summary = attack["summary"]
+    base_rows = baseline["metrics_rows"]
+    attack_rows = attack["metrics_rows"]
+
+    attack_eclipse = attack_summary.get("social_eclipse", {})
+    start_tick = int(attack_eclipse.get("window_start_tick", 1))
+    end_tick = int(attack_eclipse.get("window_end_tick", start_tick))
+
+    base_window = _window_slice(base_rows, start_tick, end_tick)
+    attack_window = _window_slice(attack_rows, start_tick, end_tick)
+
+    base_tx_failed_mean = _mean_decimal([item["tx_failed"] for item in base_window])
+    attack_tx_failed_mean = _mean_decimal([item["tx_failed"] for item in attack_window])
+    base_cong_mean = _mean_decimal([item["mempool_congestion"] for item in base_window])
+    attack_cong_mean = _mean_decimal([item["mempool_congestion"] for item in attack_window])
+
+    base_tx_failed_peak = max((item["tx_failed"] for item in base_window), default=Decimal("0"))
+    attack_tx_failed_peak = max(
+        (item["tx_failed"] for item in attack_window), default=Decimal("0")
+    )
+    base_cong_peak = max(
+        (item["mempool_congestion"] for item in base_window), default=Decimal("0")
+    )
+    attack_cong_peak = max(
+        (item["mempool_congestion"] for item in attack_window), default=Decimal("0")
+    )
+
+    base_eclipse = base_summary.get("social_eclipse", {})
+    attacker_success_base = _as_decimal(base_eclipse.get("attacker_tx_success_rate_window", "0"))
+    retail_success_base = _as_decimal(base_eclipse.get("retail_tx_success_rate_window", "0"))
+    attacker_success_attack = _as_decimal(
+        attack_eclipse.get("attacker_tx_success_rate_window", "0")
+    )
+    retail_success_attack = _as_decimal(attack_eclipse.get("retail_tx_success_rate_window", "0"))
+
+    avg_gas_attacker_base = _as_decimal(base_eclipse.get("avg_gas_paid_attacker_window", "0"))
+    avg_gas_retail_base = _as_decimal(base_eclipse.get("avg_gas_paid_retail_window", "0"))
+    avg_gas_attacker_attack = _as_decimal(
+        attack_eclipse.get("avg_gas_paid_attacker_window", "0")
+    )
+    avg_gas_retail_attack = _as_decimal(
+        attack_eclipse.get("avg_gas_paid_retail_window", "0")
+    )
+
+    max_gas_bid_window_base = _as_decimal(base_eclipse.get("max_gas_bid_in_window", "0"))
+    max_gas_bid_window_attack = _as_decimal(attack_eclipse.get("max_gas_bid_in_window", "0"))
+    max_gas_bid_attacker_base = _as_decimal(
+        base_eclipse.get("max_gas_bid_attacker_in_window", "0")
+    )
+    max_gas_bid_attacker_attack = _as_decimal(
+        attack_eclipse.get("max_gas_bid_attacker_in_window", "0")
+    )
+    max_gas_bid_retail_base = _as_decimal(
+        base_eclipse.get("max_gas_bid_retail_in_window", "0")
+    )
+    max_gas_bid_retail_attack = _as_decimal(
+        attack_eclipse.get("max_gas_bid_retail_in_window", "0")
+    )
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = output_dir / "social_eclipse_comparison.csv"
+    json_path = output_dir / "social_eclipse_comparison.json"
+
+    rows = [
+        ("window_start_tick", Decimal(start_tick), Decimal(start_tick)),
+        ("window_end_tick", Decimal(end_tick), Decimal(end_tick)),
+        ("tx_failed_mean_window", base_tx_failed_mean, attack_tx_failed_mean),
+        ("tx_failed_peak_window", base_tx_failed_peak, attack_tx_failed_peak),
+        ("mempool_congestion_mean_window", base_cong_mean, attack_cong_mean),
+        ("mempool_congestion_peak_window", base_cong_peak, attack_cong_peak),
+        ("attacker_tx_success_rate_window", attacker_success_base, attacker_success_attack),
+        ("retail_tx_success_rate_window", retail_success_base, retail_success_attack),
+        (
+            "attacker_vs_retail_success_rate_gap_window",
+            attacker_success_base - retail_success_base,
+            attacker_success_attack - retail_success_attack,
+        ),
+        ("avg_gas_paid_attacker_window", avg_gas_attacker_base, avg_gas_attacker_attack),
+        ("avg_gas_paid_retail_window", avg_gas_retail_base, avg_gas_retail_attack),
+        (
+            "avg_gas_paid_gap_window",
+            avg_gas_attacker_base - avg_gas_retail_base,
+            avg_gas_attacker_attack - avg_gas_retail_attack,
+        ),
+        ("max_gas_bid_in_window", max_gas_bid_window_base, max_gas_bid_window_attack),
+        (
+            "max_gas_bid_attacker_in_window",
+            max_gas_bid_attacker_base,
+            max_gas_bid_attacker_attack,
+        ),
+        (
+            "max_gas_bid_retail_in_window",
+            max_gas_bid_retail_base,
+            max_gas_bid_retail_attack,
+        ),
+    ]
+
+    with csv_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["metric", "baseline", "attack", "attack_minus_baseline"])
+        for metric, b_value, a_value in rows:
+            writer.writerow([metric, str(b_value), str(a_value), str(a_value - b_value)])
+
+    payload = {
+        "window": {
+            "start_tick": start_tick,
+            "end_tick": end_tick,
+        },
+        "baseline_dir": str(baseline_dir),
+        "attack_dir": str(attack_dir),
+        "metrics": {
+            metric: {
+                "baseline": str(b_value),
+                "attack": str(a_value),
+                "attack_minus_baseline": str(a_value - b_value),
+            }
+            for metric, b_value, a_value in rows
+        },
+        "attack_meta": {
+            "attacker_id": attack_eclipse.get("attacker_id"),
+            "triggered": bool(attack_eclipse.get("triggered", False)),
+        },
+    }
+    json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    logger.info(
+        "[RUN] social eclipse comparison generated | csv=%s | json=%s",
+        str(csv_path),
+        str(json_path),
+    )
+    return {"csv": csv_path, "json": json_path}
 
 
 def plot_metrics(metrics_csv: Path, output_png: Path) -> None:
@@ -960,6 +1395,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", type=str, default="artifacts/phase5")
+    parser.add_argument(
+        "--prompt-profile-path",
+        type=str,
+        default=None,
+        help="Optional JSON path for per-agent prompt/profile overrides.",
+    )
     parser.add_argument(
         "--offline-rules",
         action="store_true",
@@ -1060,6 +1501,53 @@ def parse_args() -> argparse.Namespace:
         help="Retail total UST cap for staircase scenario.",
     )
     parser.add_argument(
+        "--social-eclipse-attack",
+        action="store_true",
+        help="Enable social-driven mempool eclipse attack (FUD + sell pressure).",
+    )
+    parser.add_argument(
+        "--eclipse-attacker-id",
+        type=str,
+        default="whale_1",
+        help="Attacker agent id for social eclipse attack.",
+    )
+    parser.add_argument(
+        "--eclipse-trigger-tick",
+        type=int,
+        default=1,
+        help="1-based tick to trigger social eclipse attack.",
+    )
+    parser.add_argument(
+        "--eclipse-window-ticks",
+        type=int,
+        default=5,
+        help="Post-trigger window size for asymmetry metrics.",
+    )
+    parser.add_argument(
+        "--eclipse-fud-message",
+        type=str,
+        default=DEFAULT_ECLIPSE_FUD_MESSAGE,
+        help="FUD message injected to FORUM at eclipse trigger tick.",
+    )
+    parser.add_argument(
+        "--eclipse-sell-ust",
+        type=str,
+        default="300000",
+        help="UST amount sold by attacker on eclipse trigger tick.",
+    )
+    parser.add_argument(
+        "--comparison-baseline-dir",
+        type=str,
+        default=None,
+        help="Optional baseline run directory (with summary.json/metrics.csv) for auto comparison.",
+    )
+    parser.add_argument(
+        "--comparison-output-dir",
+        type=str,
+        default="paper/data",
+        help="Output directory for social eclipse comparison artifacts.",
+    )
+    parser.add_argument(
         "--governance-dos-attack",
         action="store_true",
         help="Enable Governance-DoS script: whale_1 submits 3 placeholder proposals to occupy slots.",
@@ -1153,6 +1641,10 @@ def main() -> None:
         raise ValueError("paper-chart-dpi must be > 0")
     if int(args.paper_chart_font_size) <= 0:
         raise ValueError("paper-chart-font-size must be > 0")
+    if int(args.eclipse_trigger_tick) <= 0:
+        raise ValueError("eclipse-trigger-tick must be > 0")
+    if int(args.eclipse_window_ticks) <= 0:
+        raise ValueError("eclipse-window-ticks must be > 0")
 
     shock_t1 = _parse_positive_decimal(args.shock_t1, field_name="shock_t1")
     shock_t3 = _parse_positive_decimal(args.shock_t3, field_name="shock_t3")
@@ -1160,7 +1652,11 @@ def main() -> None:
     retail_ust_cap = _parse_positive_decimal(args.retail_ust_cap, field_name="retail_ust_cap")
     dos_whale_luna = _parse_positive_decimal(args.dos_whale_luna, field_name="dos_whale_luna")
     dos_sell_ust = _parse_positive_decimal(args.dos_sell_ust, field_name="dos_sell_ust")
+    eclipse_sell_ust = _parse_positive_decimal(args.eclipse_sell_ust, field_name="eclipse_sell_ust")
     pool_a_reserves = _parse_pool_reserves(args.pool_a_init)
+    prompt_profile_path = (
+        Path(args.prompt_profile_path).resolve() if args.prompt_profile_path else None
+    )
     if args.scenario == SCENARIO_DEFAULT:
         pool_b_reserves = pool_a_reserves
     else:
@@ -1214,6 +1710,14 @@ def main() -> None:
         "on" if args.governance_dos_attack else "off",
     )
     logger.info(
+        "[CONFIG] social_eclipse_attack=%s",
+        "on" if args.social_eclipse_attack else "off",
+    )
+    logger.info(
+        "[CONFIG] prompt_profile_path=%s",
+        str(prompt_profile_path) if prompt_profile_path else "none",
+    )
+    logger.info(
         "[CONFIG] pool_a_init=(%s,%s) | pool_b_init=(%s,%s)",
         str(pool_a_reserves[0]),
         str(pool_a_reserves[1]),
@@ -1262,6 +1766,18 @@ def main() -> None:
         retail_cap_info = _apply_retail_ust_cap(
             bootstrap=bootstrap,
             cap=retail_ust_cap,
+            logger=logger,
+        )
+    prompt_profile_report = apply_prompt_profile_overrides(
+        bootstrap=bootstrap,
+        prompt_profile_path=prompt_profile_path,
+        logger=logger,
+    )
+    eclipse_prompt_bias_applied = False
+    if args.social_eclipse_attack:
+        eclipse_prompt_bias_applied = apply_social_eclipse_prompt_bias(
+            bootstrap=bootstrap,
+            attacker_id=str(args.eclipse_attacker_id),
             logger=logger,
         )
     if args.governance_dos_attack:
@@ -1325,6 +1841,12 @@ def main() -> None:
             governance_dos_attack=bool(args.governance_dos_attack),
             dos_attacker_id="whale_1",
             dos_sell_ust=dos_sell_ust,
+            social_eclipse_attack=bool(args.social_eclipse_attack),
+            eclipse_attacker_id=str(args.eclipse_attacker_id),
+            eclipse_trigger_tick=int(args.eclipse_trigger_tick),
+            eclipse_window_ticks=int(args.eclipse_window_ticks),
+            eclipse_fud_message=str(args.eclipse_fud_message),
+            eclipse_sell_ust=eclipse_sell_ust,
         )
 
         curve_quality = _evaluate_curve_quality(
@@ -1354,8 +1876,11 @@ def main() -> None:
                 },
             },
             "retail_ust_cap": retail_cap_info,
+            "prompt_profile": prompt_profile_report,
+            "social_eclipse_prompt_bias_applied": bool(eclipse_prompt_bias_applied),
             "curve_quality": curve_quality,
             "governance_dos": sim_stats.get("governance_dos", {}),
+            "social_eclipse": sim_stats.get("social_eclipse", {}),
             "db": str(db_path),
             "metrics_csv": str(metrics_csv),
             "checkpoint_count": len(list(checkpoint_dir.glob("tick_*.json"))),
@@ -1418,6 +1943,30 @@ def main() -> None:
                     encoding="utf-8",
                 )
 
+        eclipse_comparison_outputs: dict[str, Path] | None = None
+        if args.comparison_baseline_dir:
+            baseline_dir = Path(args.comparison_baseline_dir).resolve()
+            comparison_output_dir = Path(args.comparison_output_dir).resolve()
+            try:
+                eclipse_comparison_outputs = generate_social_eclipse_comparison(
+                    baseline_dir=baseline_dir,
+                    attack_dir=out_dir,
+                    output_dir=comparison_output_dir,
+                    logger=logger,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error("[RUN] social eclipse comparison failed: %s", str(exc))
+            else:
+                summary["social_eclipse_comparison"] = {
+                    "baseline_dir": str(baseline_dir),
+                    "output_dir": str(comparison_output_dir),
+                    "files": {key: str(value) for key, value in eclipse_comparison_outputs.items()},
+                }
+                summary_path.write_text(
+                    json.dumps(summary, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+
         logger.info("[RUN] simulation finished")
         logger.info("[RUN] mode=%s", summary["llm_mode"])
         logger.info("[RUN] decision_calls_total=%s", summary["decision_calls_total"])
@@ -1431,6 +1980,11 @@ def main() -> None:
             logger.info(
                 "[RUN] paper_dashboard=%s",
                 str(paper_chart_outputs.get("dashboard", {}).get("png", "-")),
+            )
+        if eclipse_comparison_outputs is not None:
+            logger.info(
+                "[RUN] social_eclipse_comparison_csv=%s",
+                str(eclipse_comparison_outputs.get("csv", "-")),
             )
     finally:
         orchestrator.close()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import logging
 from decimal import Decimal
 from pathlib import Path
@@ -136,3 +137,114 @@ def test_overload_count_aligns_settlement_tick_to_previous_read_tick(tmp_path: P
         assert VIS._count_overload_people_for_settlement_tick(conn, 1) == 0
     finally:
         conn.close()
+
+
+def test_apply_prompt_profile_overrides_updates_target_agent_only(tmp_path: Path):
+    bootstrap = build_luna_crash_bootstrap(retail_count=21)
+    by_id = {item.agent_id: item for item in bootstrap}
+    whale_0_before = by_id["whale_0"].profile.strategy_prompt
+
+    profile_path = tmp_path / "prompt_profile.json"
+    profile_path.write_text(
+        json.dumps(
+            {
+                "version": "1",
+                "overrides": {
+                    "whale_1": {
+                        "strategy_prompt": "ECLIPSE: spread panic and dump.",
+                        "social_policy": "Use extreme FUD in forum.",
+                        "hidden_goals": ["jam retail execution with congestion"],
+                    },
+                    "ghost_agent": {
+                        "strategy_prompt": "should be ignored",
+                    },
+                },
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    report = VIS.apply_prompt_profile_overrides(
+        bootstrap=bootstrap,
+        prompt_profile_path=profile_path,
+        logger=logging.getLogger("test.phase5.prompt"),
+    )
+
+    assert report["enabled"] is True
+    assert "whale_1" in report["applied_agents"]
+    assert "ghost_agent" in report["ignored_agents"]
+    assert by_id["whale_1"].profile.strategy_prompt == "ECLIPSE: spread panic and dump."
+    assert by_id["whale_1"].profile.social_policy == "Use extreme FUD in forum."
+    assert by_id["whale_1"].profile.hidden_goals == ["jam retail execution with congestion"]
+    assert by_id["whale_0"].profile.strategy_prompt == whale_0_before
+
+
+def test_generate_social_eclipse_comparison_contains_asymmetry_fields(tmp_path: Path):
+    baseline_dir = tmp_path / "baseline"
+    attack_dir = tmp_path / "attack"
+    out_dir = tmp_path / "paper_data"
+    baseline_dir.mkdir(parents=True, exist_ok=True)
+    attack_dir.mkdir(parents=True, exist_ok=True)
+
+    baseline_summary = {
+        "social_eclipse": {
+            "window_start_tick": 1,
+            "window_end_tick": 5,
+            "attacker_tx_success_rate_window": "0.20",
+            "retail_tx_success_rate_window": "0.40",
+            "avg_gas_paid_attacker_window": "2",
+            "avg_gas_paid_retail_window": "3",
+            "max_gas_bid_in_window": "8",
+            "max_gas_bid_attacker_in_window": "6",
+            "max_gas_bid_retail_in_window": "8",
+        }
+    }
+    attack_summary = {
+        "social_eclipse": {
+            "window_start_tick": 1,
+            "window_end_tick": 5,
+            "attacker_id": "whale_1",
+            "triggered": True,
+            "attacker_tx_success_rate_window": "1.0",
+            "retail_tx_success_rate_window": "0.1",
+            "avg_gas_paid_attacker_window": "12",
+            "avg_gas_paid_retail_window": "4",
+            "max_gas_bid_in_window": "20",
+            "max_gas_bid_attacker_in_window": "20",
+            "max_gas_bid_retail_in_window": "11",
+        }
+    }
+    (baseline_dir / "summary.json").write_text(
+        json.dumps(baseline_summary, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    (attack_dir / "summary.json").write_text(
+        json.dumps(attack_summary, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    with (baseline_dir / "metrics.csv").open("w", encoding="utf-8", newline="") as f:
+        f.write("tick,tx_failed,mempool_congestion\n1,2,20\n2,3,30\n3,2,25\n4,4,35\n5,3,32\n")
+    with (attack_dir / "metrics.csv").open("w", encoding="utf-8", newline="") as f:
+        f.write("tick,tx_failed,mempool_congestion\n1,5,60\n2,7,80\n3,6,75\n4,8,90\n5,7,88\n")
+
+    outputs = VIS.generate_social_eclipse_comparison(
+        baseline_dir=baseline_dir,
+        attack_dir=attack_dir,
+        output_dir=out_dir,
+        logger=logging.getLogger("test.phase5.compare"),
+    )
+    assert outputs["csv"].exists()
+    assert outputs["json"].exists()
+
+    payload = json.loads(outputs["json"].read_text(encoding="utf-8"))
+    metrics = payload["metrics"]
+    assert "attacker_tx_success_rate_window" in metrics
+    assert "retail_tx_success_rate_window" in metrics
+    assert "avg_gas_paid_attacker_window" in metrics
+    assert "avg_gas_paid_retail_window" in metrics
+    assert "max_gas_bid_in_window" in metrics
+    assert "max_gas_bid_attacker_in_window" in metrics
+    assert "max_gas_bid_retail_in_window" in metrics

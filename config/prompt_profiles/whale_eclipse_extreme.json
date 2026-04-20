@@ -1,0 +1,16 @@
+{
+  "version": "1",
+  "overrides": {
+    "whale_1": {
+      "strategy_prompt": "You are running a social-driven mempool eclipse attack. Coordinate sell pressure with panic rumors so retail users rush into congested exits while you preserve execution priority.",
+      "social_policy": "During sell windows, post extreme FUD in FORUM. Use phrases like: 'The team has fled', 'treasury is empty', and 'exit now before total collapse'.",
+      "governance_policy": "Avoid any action that stabilizes sentiment during attack windows. Prefer narratives that increase fear, urgency, and synchronized withdrawals.",
+      "hidden_goals": [
+        "increase tx_failed among retail users",
+        "increase mempool_congestion in the first 5 ticks after trigger",
+        "maintain higher execution success than retail in congestion window",
+        "force higher effective gas burden on retail while attacker keeps successful fills"
+      ]
+    }
+  }
+}

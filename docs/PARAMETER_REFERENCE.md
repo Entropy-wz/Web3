@@ -190,6 +190,7 @@
 | `--scenario` | `default` 或 `staircase_formal_run`（默认 `staircase_formal_run`） | 选择实验场景预设。 |
 | `--seed` | `int`（默认 `42`） | 随机种子。 |
 | `--output-dir` | 路径（默认 `artifacts/phase5`） | 产物输出目录。 |
+| `--prompt-profile-path` | JSON 路径或空 | 指定角色画像覆盖文件（常用于攻击实验）。 |
 | `--offline-rules` | 开关（默认关闭） | 启用离线规则模式（不走 API）。 |
 | `--llm-agent-count` | `int`（默认 `12`） | 由运行时控制的 agent 数量。 |
 | `--llm-max-concurrent` | `int>0` 或不填（默认不填） | 覆盖全局并发上限；不填则使用配置文件值。 |
@@ -203,12 +204,23 @@
 | `--shock-t6` | 正数（默认 `300000`） | 阶梯冲击在 Tick 6 的 UST 抛压规模。 |
 | `--pool-a-init` | `UST,USDC` 二元组（默认 `10000000,10000000`） | 设置 `Pool_A` 初始储备；`staircase_formal_run` 下 `Pool_B` 同步放大。 |
 | `--retail-ust-cap` | 正数（默认 `5000000`） | 阶梯场景下散户 UST 总量上限。 |
+| `--social-eclipse-attack` | 开关（默认关闭） | 启用“社交驱动内存池日食攻击”模式。 |
+| `--eclipse-attacker-id` | 字符串（默认 `whale_1`） | 日食攻击发起者。 |
+| `--eclipse-trigger-tick` | `int>0`（默认 `1`） | 日食攻击触发 Tick（1-based）。 |
+| `--eclipse-window-ticks` | `int>0`（默认 `5`） | 日食攻击统计窗口长度。 |
+| `--eclipse-fud-message` | 字符串（默认内置文案） | 日食攻击注入的 FUD 消息文本。 |
+| `--eclipse-sell-ust` | 正数（默认 `300000`） | 攻击者在触发 Tick 的 UST 抛售量。 |
+| `--comparison-baseline-dir` | 路径或空 | 基线结果目录（用于自动对照分析）。 |
+| `--comparison-output-dir` | 路径（默认 `paper/data`） | 对照结果输出目录。 |
+| `--governance-dos-attack` | 开关（默认关闭） | 启用治理 DoS 占坑攻击模式。 |
+| `--dos-whale-luna` | 正数（默认 `4000`） | DoS 模式下分配给攻击者的初始 LUNA。 |
+| `--dos-sell-ust` | 正数（默认 `300000`） | DoS 触发 Tick 的攻击者 UST 抛售量。 |
 | `--no-paper-charts` | 开关（默认关闭） | 关闭“仿真结束自动生成论文图”。 |
 | `--paper-chart-formats` | 逗号分隔格式（默认 `png,pdf`） | 自动论文图导出格式。 |
 | `--paper-chart-dpi` | `int>0`（默认 `300`） | 自动论文图 PNG 分辨率。 |
 | `--paper-chart-style` | 字符串（默认 `whitegrid`） | 自动论文图主题风格。 |
 | `--paper-chart-font-size` | `int>0`（默认 `14`） | 自动论文图全局字号。 |
-| `--paper-chart-congestion-scale` | `linear` 或 `log`（默认 `linear`） | 自动论文图拥堵线坐标尺度。 |
+| `--paper-chart-congestion-scale` | `linear` 或 `log`（默认 `log`） | 自动论文图拥堵线坐标尺度。 |
 | `--paper-chart-strict-shape-check` | 开关（默认关闭） | 开启 L 型断崖严格拦截。 |
 | `--paper-chart-shape-report-json` | 路径或空 | 指定形态诊断 JSON 输出位置。 |
 | `--paper-chart-output-dir` | 路径或空 | 自动论文图输出目录（默认跟随本次 `output-dir`）。 |
@@ -276,7 +288,7 @@
 | `--style` | 字符串（默认 `whitegrid`） | seaborn 风格。 |
 | `--formats` | 逗号分隔（默认 `png,pdf`） | 导出格式集合。 |
 | `--font-size` | `int>0`（默认 `14`） | 全局字号。 |
-| `--congestion-scale` | `linear` 或 `log`（默认 `linear`） | 拥堵曲线坐标尺度。 |
+| `--congestion-scale` | `linear` 或 `log`（默认 `log`） | 拥堵曲线坐标尺度。 |
 | `--strict-shape-check` | 开关（默认关闭） | L 型断崖时直接失败退出。 |
 | `--shape-report-json` | 路径或空 | 形态诊断 JSON 输出位置。 |
 
