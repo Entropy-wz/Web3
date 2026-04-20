@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import logging
 from decimal import Decimal
 
 import pytest
 
 from ace_sim.engine.ace_engine import ACE_Engine
+from ace_sim.execution.mitigation import ExecutionCircuitBreaker
 from ace_sim.execution.orchestrator.time_orchestrator import Simulation_Orchestrator
 
 
@@ -199,3 +201,101 @@ def test_simulation_tick_drives_daily_mint_cap_reset(tmp_path):
     report_tick_2 = orchestrator.step_tick()
     assert report_tick_2.receipts[0].status == "success"
     assert engine.get_simulation_clock()["current_tick"] == 2
+
+
+def test_mitigation_b_crisis_caps_gas_and_logs_tx_id(tmp_path, caplog):
+    engine = new_engine(tmp_path)
+    engine.create_account("alice", ust="60")
+    mitigation_logger_name = "tests.aecb"
+    mitigation = ExecutionCircuitBreaker(
+        panic_threshold=Decimal("0.5"),
+        crisis_gas_cap=Decimal("10"),
+        logger=logging.getLogger(mitigation_logger_name),
+    )
+    orchestrator = Simulation_Orchestrator(engine, execution_mitigation=mitigation)
+    orchestrator._last_tick_panic_word_freq = Decimal("0.9")
+
+    tx_id = orchestrator.submit_transaction(
+        "alice",
+        "SWAP",
+        {"pool_name": "Pool_A", "token_in": "UST", "amount": "50", "slippage_tolerance": "0.9"},
+        gas_price="100",
+    )
+
+    caplog.set_level("INFO", logger=mitigation_logger_name)
+    report = orchestrator.step_tick()
+    receipt = report.receipts[0]
+
+    assert receipt.tx_id == tx_id
+    assert receipt.status == "success"
+    assert receipt.gas_bid == Decimal("100")
+    assert receipt.gas_effective == Decimal("10")
+    assert receipt.gas_paid == Decimal("10")
+    assert orchestrator.protocol_fee_vault["UST"] == Decimal("10")
+    assert engine.get_account_balance("alice", "UST") == Decimal("0")
+    log_text = "\n".join(item.message for item in caplog.records)
+    assert "[GAS-CAPPED]" in log_text
+    assert tx_id in log_text
+
+
+def test_mitigation_b_not_triggered_keeps_gas_order(tmp_path):
+    engine = new_engine(tmp_path)
+    engine.create_account("alice", ust="1000")
+    engine.create_account("bob", ust="1000")
+    mitigation = ExecutionCircuitBreaker(panic_threshold=Decimal("0.5"), crisis_gas_cap=Decimal("10"))
+    orchestrator = Simulation_Orchestrator(engine, execution_mitigation=mitigation)
+    orchestrator._last_tick_panic_word_freq = Decimal("0.1")
+
+    orchestrator.submit_transaction(
+        "alice",
+        "SWAP",
+        {"pool_name": "Pool_A", "token_in": "UST", "amount": "50", "slippage_tolerance": "0.9"},
+        gas_price="5",
+    )
+    orchestrator.submit_transaction(
+        "bob",
+        "SWAP",
+        {"pool_name": "Pool_A", "token_in": "UST", "amount": "50", "slippage_tolerance": "0.9"},
+        gas_price="10",
+    )
+
+    report = orchestrator.step_tick()
+    assert [item.agent_id for item in report.receipts] == ["bob", "alice"]
+    assert [item.gas_effective for item in report.receipts] == [Decimal("10"), Decimal("5")]
+
+
+def test_mitigation_b_fair_sort_prefers_retail_in_crisis(tmp_path):
+    engine = new_engine(tmp_path)
+    engine.create_account("whale_0", ust="1000")
+    engine.create_account("retail_0", ust="1000")
+    mitigation = ExecutionCircuitBreaker(
+        panic_threshold=Decimal("0.5"),
+        crisis_gas_cap=Decimal("50"),
+        gas_weight=Decimal("0.2"),
+        age_weight=Decimal("0.8"),
+        role_bias={
+            "retail": Decimal("1.0"),
+            "project": Decimal("0.6"),
+            "whale": Decimal("0.2"),
+        },
+    )
+    orchestrator = Simulation_Orchestrator(engine, execution_mitigation=mitigation)
+    orchestrator.register_agent("whale_0", role="whale", community_id="c1")
+    orchestrator.register_agent("retail_0", role="retail", community_id="c0")
+    orchestrator._last_tick_panic_word_freq = Decimal("0.9")
+
+    orchestrator.submit_transaction(
+        "whale_0",
+        "SWAP",
+        {"pool_name": "Pool_A", "token_in": "UST", "amount": "10", "slippage_tolerance": "0.9"},
+        gas_price="10",
+    )
+    orchestrator.submit_transaction(
+        "retail_0",
+        "SWAP",
+        {"pool_name": "Pool_A", "token_in": "UST", "amount": "10", "slippage_tolerance": "0.9"},
+        gas_price="10",
+    )
+
+    report = orchestrator.step_tick()
+    assert [item.agent_id for item in report.receipts] == ["retail_0", "whale_0"]

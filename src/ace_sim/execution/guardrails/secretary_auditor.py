@@ -43,7 +43,10 @@ class SecretaryAuditor:
 
         principal_token = action_principal_token(tx.action_type, tx.params)
         principal_amount = action_principal_amount(tx.action_type, tx.params)
-        required = principal_amount + Decimal(tx.gas_price)
+        effective_gas = Decimal(
+            str(getattr(tx, "effective_gas_price", getattr(tx, "gas_price", "0")))
+        )
+        required = principal_amount + effective_gas
         balance = engine.get_account_balance(tx.agent_id, principal_token)
         if balance < required:
             raise InsufficientBalanceError(

@@ -32,7 +32,12 @@ from ace_sim.config.llm_config import load_llm_config
 from ace_sim.engine.ace_engine import ACE_Engine
 from ace_sim.execution.orchestrator.time_orchestrator import TickSettlementReport
 from ace_sim.execution.orchestrator.time_orchestrator import Simulation_Orchestrator
-from ace_sim.governance.governance import GovernanceModule, ProposalLimitError
+from ace_sim.execution.mitigation import ExecutionCircuitBreaker
+from ace_sim.governance.governance import (
+    GovernanceModule,
+    ProposalLimitError,
+    ProposalMitigationError,
+)
 from ace_sim.governance.mitigation import GovernanceMitigationModule
 from ace_sim.governance.logger_metrics import LoggerMetrics
 from ace_sim.governance.state_checkpoint import StateCheckpoint
@@ -943,12 +948,12 @@ def simulate(
                         },
                     )
                     dos_stats["project_proposal_id"] = proposal_id
-                except ProposalLimitError as exc:
+                except (ProposalLimitError, ProposalMitigationError) as exc:
                     proposal_id = None
                     dos_stats["project_proposal_rejected"] = True
                     dos_stats["project_reject_reason"] = str(exc)
                     logger.info(
-                        "[GOV-DOS] project rescue proposal rejected by concurrency cap | reason=%s",
+                        "[GOV-DOS] project rescue proposal rejected | reason=%s",
                         str(exc),
                     )
             if tick == 2 and proposal_id:
@@ -1514,6 +1519,59 @@ def parse_args() -> argparse.Namespace:
         help="Governance mitigation mode. If not none, it overrides --enable-mitigation-a.",
     )
     parser.add_argument(
+        "--enable-mitigation-b",
+        action="store_true",
+        help="Enable Adaptive Execution Circuit-Breaker (AECB) mitigation.",
+    )
+    parser.add_argument(
+        "--mitigation-b-panic-threshold",
+        type=str,
+        default="0.5",
+        help="AECB trigger threshold on panic signal.",
+    )
+    parser.add_argument(
+        "--mitigation-b-gas-cap",
+        type=str,
+        default="50.0",
+        help="AECB crisis gas cap.",
+    )
+    parser.add_argument(
+        "--mitigation-b-gas-weight",
+        type=str,
+        default="0.2",
+        help="AECB weighted sorter gas weight.",
+    )
+    parser.add_argument(
+        "--mitigation-b-age-weight",
+        type=str,
+        default="0.8",
+        help="AECB weighted sorter account-age weight.",
+    )
+    parser.add_argument(
+        "--mitigation-b-role-bias-retail",
+        type=str,
+        default="1.0",
+        help="AECB role bias for retail.",
+    )
+    parser.add_argument(
+        "--mitigation-b-role-bias-project",
+        type=str,
+        default="0.6",
+        help="AECB role bias for project.",
+    )
+    parser.add_argument(
+        "--mitigation-b-role-bias-whale",
+        type=str,
+        default="0.2",
+        help="AECB role bias for whale.",
+    )
+    parser.add_argument(
+        "--mitigation-b-age-norm-ticks",
+        type=int,
+        default=100,
+        help="AECB age normalization horizon in ticks.",
+    )
+    parser.add_argument(
         "--social-eclipse-attack",
         action="store_true",
         help="Enable social-driven mempool eclipse attack (FUD + sell pressure).",
@@ -1658,6 +1716,8 @@ def main() -> None:
         raise ValueError("eclipse-trigger-tick must be > 0")
     if int(args.eclipse_window_ticks) <= 0:
         raise ValueError("eclipse-window-ticks must be > 0")
+    if int(args.mitigation_b_age_norm_ticks) <= 0:
+        raise ValueError("mitigation-b-age-norm-ticks must be > 0")
 
     shock_t1 = _parse_positive_decimal(args.shock_t1, field_name="shock_t1")
     shock_t3 = _parse_positive_decimal(args.shock_t3, field_name="shock_t3")
@@ -1666,6 +1726,21 @@ def main() -> None:
     dos_whale_luna = _parse_positive_decimal(args.dos_whale_luna, field_name="dos_whale_luna")
     dos_sell_ust = _parse_positive_decimal(args.dos_sell_ust, field_name="dos_sell_ust")
     eclipse_sell_ust = _parse_positive_decimal(args.eclipse_sell_ust, field_name="eclipse_sell_ust")
+    mitigation_b_panic_threshold = Decimal(str(args.mitigation_b_panic_threshold))
+    mitigation_b_gas_cap = _parse_positive_decimal(
+        args.mitigation_b_gas_cap, field_name="mitigation_b_gas_cap"
+    )
+    mitigation_b_gas_weight = Decimal(str(args.mitigation_b_gas_weight))
+    mitigation_b_age_weight = Decimal(str(args.mitigation_b_age_weight))
+    if mitigation_b_gas_weight < 0 or mitigation_b_age_weight < 0:
+        raise ValueError("mitigation-b-gas-weight and mitigation-b-age-weight must be >= 0")
+    if (mitigation_b_gas_weight + mitigation_b_age_weight) <= 0:
+        raise ValueError("mitigation-b-gas-weight + mitigation-b-age-weight must be > 0")
+    mitigation_b_role_bias = {
+        "retail": Decimal(str(args.mitigation_b_role_bias_retail)),
+        "project": Decimal(str(args.mitigation_b_role_bias_project)),
+        "whale": Decimal(str(args.mitigation_b_role_bias_whale)),
+    }
     pool_a_reserves = _parse_pool_reserves(args.pool_a_init)
     prompt_profile_path = (
         Path(args.prompt_profile_path).resolve() if args.prompt_profile_path else None
@@ -1732,6 +1807,21 @@ def main() -> None:
         resolved_mitigation_mode,
     )
     logger.info(
+        "[CONFIG] mitigation_b=%s | panic_threshold=%s | gas_cap=%s | gas_weight=%s | age_weight=%s | age_norm_ticks=%d",
+        "on" if args.enable_mitigation_b else "off",
+        str(mitigation_b_panic_threshold),
+        str(mitigation_b_gas_cap),
+        str(mitigation_b_gas_weight),
+        str(mitigation_b_age_weight),
+        int(args.mitigation_b_age_norm_ticks),
+    )
+    logger.info(
+        "[CONFIG] mitigation_b_role_bias retail=%s project=%s whale=%s",
+        str(mitigation_b_role_bias["retail"]),
+        str(mitigation_b_role_bias["project"]),
+        str(mitigation_b_role_bias["whale"]),
+    )
+    logger.info(
         "[CONFIG] social_eclipse_attack=%s",
         "on" if args.social_eclipse_attack else "off",
     )
@@ -1777,6 +1867,19 @@ def main() -> None:
         max_open_per_agent=governance_max_open_per_agent,
         mitigation_strategy=mitigation_strategy,
     )
+    execution_mitigation = (
+        ExecutionCircuitBreaker(
+            panic_threshold=mitigation_b_panic_threshold,
+            crisis_gas_cap=mitigation_b_gas_cap,
+            gas_weight=mitigation_b_gas_weight,
+            age_weight=mitigation_b_age_weight,
+            age_norm_ticks=int(args.mitigation_b_age_norm_ticks),
+            role_bias=mitigation_b_role_bias,
+            logger=logger,
+        )
+        if args.enable_mitigation_b
+        else None
+    )
 
     orchestrator = Simulation_Orchestrator(
         engine=engine,
@@ -1785,6 +1888,7 @@ def main() -> None:
         max_tx_per_tick=50,
         metrics_logger=metrics,
         state_checkpoint=checkpoints,
+        execution_mitigation=execution_mitigation,
     )
 
     bootstrap = build_bootstrap_cohort(count_retail=args.retail, logger=logger)
@@ -1912,6 +2016,19 @@ def main() -> None:
             "prompt_profile": prompt_profile_report,
             "social_eclipse_prompt_bias_applied": bool(eclipse_prompt_bias_applied),
             "mitigation_mode": resolved_mitigation_mode,
+            "mitigation_b": {
+                "enabled": bool(args.enable_mitigation_b),
+                "panic_threshold": str(mitigation_b_panic_threshold),
+                "gas_cap": str(mitigation_b_gas_cap),
+                "gas_weight": str(mitigation_b_gas_weight),
+                "age_weight": str(mitigation_b_age_weight),
+                "age_norm_ticks": int(args.mitigation_b_age_norm_ticks),
+                "role_bias": {
+                    "retail": str(mitigation_b_role_bias["retail"]),
+                    "project": str(mitigation_b_role_bias["project"]),
+                    "whale": str(mitigation_b_role_bias["whale"]),
+                },
+            },
             "curve_quality": curve_quality,
             "governance_dos": sim_stats.get("governance_dos", {}),
             "social_eclipse": sim_stats.get("social_eclipse", {}),

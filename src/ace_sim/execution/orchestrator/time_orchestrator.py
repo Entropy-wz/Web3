@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from collections import deque
 from dataclasses import dataclass, field
@@ -31,6 +32,7 @@ from ...governance.governance import GovernanceModule
 from ...governance.logger_metrics import LoggerMetrics
 from ...governance.state_checkpoint import StateCheckpoint
 from ..guardrails.secretary_auditor import InsufficientBalanceError, SecretaryAuditor
+from ..mitigation import BaseExecutionMitigation, semantic_panic_ratio_from_deliveries
 
 
 @dataclass
@@ -42,6 +44,9 @@ class Transaction:
     gas_price: Decimal
     enqueue_seq: int
     submit_tick: int
+    raw_gas_price: Decimal | None = None
+    effective_gas_price: Decimal | None = None
+    mitigation_flags: list[str] = field(default_factory=list)
     resolved_min_amount_out: Decimal | None = None
     estimated_amount_out: Decimal | None = None
 
@@ -65,6 +70,7 @@ class TxReceipt:
     action_type: str
     agent_id: str
     gas_bid: Decimal = Decimal("0")
+    gas_effective: Decimal = Decimal("0")
     gas_token: str | None = None
     gas_paid: Decimal = Decimal("0")
     error_code: str | None = None
@@ -101,6 +107,7 @@ class Simulation_Orchestrator:
         default_max_inbox_size: int = 5,
         metrics_logger: LoggerMetrics | None = None,
         state_checkpoint: StateCheckpoint | None = None,
+        execution_mitigation: BaseExecutionMitigation | None = None,
     ) -> None:
         if ticks_per_day <= 0:
             raise ValueError("ticks_per_day must be > 0")
@@ -130,6 +137,10 @@ class Simulation_Orchestrator:
         self.governance = governance or GovernanceModule(db_path=self.engine.get_db_path())
         self.metrics_logger = metrics_logger
         self.state_checkpoint = state_checkpoint
+        self.execution_mitigation = execution_mitigation
+        self._logger = logging.getLogger(__name__)
+        self._last_tick_panic_word_freq: Decimal = Decimal("0")
+        self._account_first_seen_tick: dict[str, int] = {}
         self._event_subscribers: list[Callable[[SemanticEvent], None]] = []
 
         if channel_manager is not None:
@@ -162,6 +173,7 @@ class Simulation_Orchestrator:
     # --------------------------
     def register_agent(self, agent_id: str, role: str, community_id: str) -> None:
         self.topology.add_agent(agent_id=agent_id, role=role, community_id=community_id)
+        self._account_first_seen_tick.setdefault(str(agent_id), int(self.current_tick))
 
     def connect_agents(self, sender: str, receiver: str, weight: float = 1.0) -> None:
         self.topology.connect(sender=sender, receiver=receiver, weight=weight)
@@ -349,8 +361,11 @@ class Simulation_Orchestrator:
             gas_price=gas_price_dec,
             enqueue_seq=self.enqueue_seq,
             submit_tick=self.current_tick,
+            raw_gas_price=gas_price_dec,
+            effective_gas_price=gas_price_dec,
         )
         self.enqueue_seq += 1
+        self._account_first_seen_tick.setdefault(str(agent_id), int(self.current_tick))
 
         if normalized_action == "SWAP":
             self.secretary.resolve_swap_guardrail(tx, self.engine)
@@ -373,9 +388,45 @@ class Simulation_Orchestrator:
         # Drain semantic bus first, then deliver only due messages for current tick.
         self.process_fast_events()
         semantic_due = self.channel_manager.deliver_due(current_tick=self.current_tick)
+        current_semantic_panic = semantic_panic_ratio_from_deliveries(
+            [self._delivery_to_dict(item) for item in semantic_due]
+        )
 
         batch_all = self._drain_mempool()
-        batch_all.sort(key=lambda tx: (-tx.gas_price, tx.enqueue_seq))
+        for tx in batch_all:
+            if tx.raw_gas_price is None:
+                tx.raw_gas_price = Decimal(str(tx.gas_price))
+            tx.effective_gas_price = Decimal(str(tx.raw_gas_price))
+            tx.mitigation_flags = []
+
+        if self.execution_mitigation is not None:
+            account_roles: dict[str, str] = {}
+            for tx in batch_all:
+                agent = str(tx.agent_id)
+                if agent in account_roles:
+                    continue
+                role = "retail"
+                if agent in self.topology.graph:
+                    role = str(self.topology.graph.nodes[agent].get("role", "retail"))
+                account_roles[agent] = role
+                self._account_first_seen_tick.setdefault(agent, int(self.current_tick))
+
+            mitigation_result = self.execution_mitigation.apply_policy(
+                transactions=batch_all,
+                current_tick=self.current_tick,
+                last_tick_panic_word_freq=self._last_tick_panic_word_freq,
+                current_semantic_panic_word_freq=current_semantic_panic,
+                account_first_seen_tick=self._account_first_seen_tick,
+                account_roles=account_roles,
+            )
+            batch_all = list(mitigation_result.ordered_transactions)
+        else:
+            batch_all.sort(
+                key=lambda tx: (
+                    -Decimal(str(tx.effective_gas_price)),
+                    tx.enqueue_seq,
+                )
+            )
         batch = batch_all[: self.max_tx_per_tick]
         leftovers = batch_all[self.max_tx_per_tick :]
         if leftovers:
@@ -389,15 +440,20 @@ class Simulation_Orchestrator:
                 self.secretary.precheck_transaction(tx, self.engine, self.current_tick)
 
                 gas_token = action_principal_token(tx.action_type, tx.params)
-                if tx.gas_price > 0:
+                effective_gas = Decimal(str(tx.effective_gas_price))
+                raw_gas = Decimal(str(tx.raw_gas_price))
+                if effective_gas > 0:
                     self.engine.charge_fee(
                         address=tx.agent_id,
                         token=gas_token,
-                        amount=tx.gas_price,
-                        reason=f"tick={self.current_tick},tx={tx.tx_id}",
+                        amount=effective_gas,
+                        reason=(
+                            f"tick={self.current_tick},tx={tx.tx_id},"
+                            f"raw_gas={raw_gas},effective_gas={effective_gas}"
+                        ),
                     )
-                    self.protocol_fee_vault[gas_token] += tx.gas_price
-                    gas_paid = tx.gas_price
+                    self.protocol_fee_vault[gas_token] += effective_gas
+                    gas_paid = effective_gas
 
                 result = self._dispatch_economic_tx(tx)
                 receipts.append(
@@ -408,7 +464,8 @@ class Simulation_Orchestrator:
                         status="success",
                         action_type=tx.action_type,
                         agent_id=tx.agent_id,
-                        gas_bid=tx.gas_price,
+                        gas_bid=Decimal(str(tx.raw_gas_price)),
+                        gas_effective=Decimal(str(tx.effective_gas_price)),
                         gas_token=gas_token,
                         gas_paid=gas_paid,
                         result=result,
@@ -423,7 +480,8 @@ class Simulation_Orchestrator:
                         status="failed",
                         action_type=tx.action_type,
                         agent_id=tx.agent_id,
-                        gas_bid=tx.gas_price,
+                        gas_bid=Decimal(str(tx.raw_gas_price)),
+                        gas_effective=Decimal(str(tx.effective_gas_price)),
                         gas_token=gas_token,
                         gas_paid=gas_paid,
                         error_code="SlippageExceededError",
@@ -446,7 +504,8 @@ class Simulation_Orchestrator:
                         status="failed",
                         action_type=tx.action_type,
                         agent_id=tx.agent_id,
-                        gas_bid=tx.gas_price,
+                        gas_bid=Decimal(str(tx.raw_gas_price)),
+                        gas_effective=Decimal(str(tx.effective_gas_price)),
                         gas_token=gas_token,
                         gas_paid=gas_paid,
                         error_code=type(exc).__name__,
@@ -463,7 +522,8 @@ class Simulation_Orchestrator:
                         status="fatal",
                         action_type=tx.action_type,
                         agent_id=tx.agent_id,
-                        gas_bid=tx.gas_price,
+                        gas_bid=Decimal(str(tx.raw_gas_price)),
+                        gas_effective=Decimal(str(tx.effective_gas_price)),
                         gas_token=gas_token,
                         gas_paid=gas_paid,
                         error_code="InvariantViolationError",
@@ -493,6 +553,7 @@ class Simulation_Orchestrator:
             self.state_checkpoint.save_tick(orchestrator=self, report=report)
 
         self.tick_history[self.current_tick] = report
+        self._last_tick_panic_word_freq = current_semantic_panic
         return report
 
     def _drain_mempool(self) -> list[Transaction]:
