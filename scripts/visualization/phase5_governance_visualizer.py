@@ -6,6 +6,7 @@ import json
 import logging
 import random
 import sqlite3
+import subprocess
 import sys
 import time
 from decimal import Decimal
@@ -76,6 +77,412 @@ PROMPT_OVERRIDE_FIELDS = {
     "governance_policy",
     "hidden_goals",
 }
+TRAFFIC_PROFILE_CHOICES = ("stress", "eval")
+DEFAULT_PRETTY_SEEDS = (42, 77, 101, 131, 202, 303, 404, 505)
+PRETTY_PRESET_DEFAULTS: dict[str, Any] = {
+    "scenario": SCENARIO_DEFAULT,
+    "ticks": 80,
+    "retail": 24,
+    "llm_agent_count": 27,
+    "pool_a_init": "10000000,10000000",
+    "retail_ust_cap": "5000000",
+    "shock_t1": "1000000",
+    "shock_t3": "500000",
+    "shock_t6": "300000",
+    "voting_window_ticks": 12,
+    "max_inbox_size": 5,
+    "paper_chart_congestion_scale": "log",
+}
+
+
+def _parse_seed_list(raw: str | None) -> list[int]:
+    if raw is None:
+        return []
+    text = str(raw).strip()
+    if not text:
+        return []
+    if text.lower() in {"auto", "default", "pretty"}:
+        return list(DEFAULT_PRETTY_SEEDS)
+    values: list[int] = []
+    for item in text.split(","):
+        token = item.strip()
+        if not token:
+            continue
+        values.append(int(token))
+    deduped: list[int] = []
+    seen: set[int] = set()
+    for value in values:
+        if value in seen:
+            continue
+        deduped.append(value)
+        seen.add(value)
+    return deduped
+
+
+def _apply_best_looking_preset(args: argparse.Namespace) -> dict[str, dict[str, Any]]:
+    if not bool(getattr(args, "best_looking_preset", False)):
+        return {}
+    overrides: dict[str, dict[str, Any]] = {}
+    for key, target_value in PRETTY_PRESET_DEFAULTS.items():
+        current_value = getattr(args, key)
+        if current_value == target_value:
+            continue
+        overrides[key] = {"from": current_value, "to": target_value}
+        setattr(args, key, target_value)
+    return overrides
+
+
+def _strip_cli_option_tokens(argv: list[str], *, option: str) -> list[str]:
+    out: list[str] = []
+    skip_next = False
+    for idx, token in enumerate(argv):
+        if skip_next:
+            skip_next = False
+            continue
+        if token == option:
+            if idx + 1 < len(argv) and not argv[idx + 1].startswith("--"):
+                skip_next = True
+            continue
+        if token.startswith(f"{option}="):
+            continue
+        out.append(token)
+    return out
+
+
+def _extract_curve_tick_price(
+    key_ticks: dict[str, Any],
+    key: str,
+    fallback: str = "",
+) -> str:
+    raw = key_ticks.get(key, "")
+    if isinstance(raw, dict):
+        value = raw.get("ust_price", raw.get("price", raw.get("value", "")))
+        if value is None:
+            return fallback
+        text = str(value).strip()
+        return text if text else fallback
+    if raw is None:
+        return fallback
+    text = str(raw).strip()
+    return text if text else fallback
+
+
+def _to_decimal(value: Any, fallback: Decimal) -> Decimal:
+    try:
+        return Decimal(str(value))
+    except Exception:  # noqa: BLE001
+        return fallback
+
+
+def _compute_pretty_score(summary: dict[str, Any]) -> Decimal:
+    curve = summary.get("curve_quality", {}) or {}
+    key_ticks = curve.get("key_ticks", {}) or {}
+    p1 = _to_decimal(_extract_curve_tick_price(key_ticks, "1", "1"), Decimal("1"))
+    p3 = _to_decimal(_extract_curve_tick_price(key_ticks, "3", str(p1)), p1)
+    p6 = _to_decimal(_extract_curve_tick_price(key_ticks, "6", str(p3)), p3)
+    p10 = _to_decimal(_extract_curve_tick_price(key_ticks, "10", str(p6)), p6)
+    early_near_zero = bool(curve.get("early_near_zero", False))
+
+    score = Decimal("0")
+    if not early_near_zero:
+        score += Decimal("50")
+    if Decimal("0.65") <= p1 <= Decimal("0.90"):
+        score += Decimal("15")
+    if Decimal("0.45") <= p3 <= Decimal("0.80"):
+        score += Decimal("15")
+    if Decimal("0.25") <= p6 <= Decimal("0.65"):
+        score += Decimal("15")
+    if p10 > Decimal("0.05"):
+        score += Decimal("10")
+    if p1 >= p3 >= p6:
+        score += Decimal("10")
+    if p1 > Decimal("0"):
+        score += (p3 / p1) * Decimal("3")
+    if p3 > Decimal("0"):
+        score += (p6 / p3) * Decimal("2")
+    return score.quantize(Decimal("0.0001"))
+
+
+def _run_multi_seed_sweep(args: argparse.Namespace, seeds: list[int], argv: list[str]) -> int:
+    script_path = Path(__file__).resolve()
+    root_output = Path(args.output_dir).resolve()
+    root_output.mkdir(parents=True, exist_ok=True)
+
+    base_args = list(argv)
+    for option in ("--seed-list", "--seed", "--output-dir"):
+        base_args = _strip_cli_option_tokens(base_args, option=option)
+
+    rows: list[dict[str, Any]] = []
+    failures: list[dict[str, Any]] = []
+    total = len(seeds)
+    for index, seed in enumerate(seeds, start=1):
+        run_dir = root_output / f"s{seed}"
+        cmd = [
+            sys.executable,
+            str(script_path),
+            *base_args,
+            "--seed",
+            str(seed),
+            "--output-dir",
+            str(run_dir),
+        ]
+        print(
+            f"[SEED-SWEEP] ({index}/{total}) seed={seed} -> {run_dir}",
+            flush=True,
+        )
+        result = subprocess.run(cmd, check=False)
+        if result.returncode != 0:
+            failures.append(
+                {
+                    "seed": seed,
+                    "returncode": result.returncode,
+                    "output_dir": str(run_dir),
+                }
+            )
+            continue
+
+        summary_path = run_dir / "summary.json"
+        if not summary_path.exists():
+            failures.append(
+                {
+                    "seed": seed,
+                    "returncode": 0,
+                    "output_dir": str(run_dir),
+                    "error": "missing summary.json",
+                }
+            )
+            continue
+        payload = json.loads(summary_path.read_text(encoding="utf-8"))
+        curve = payload.get("curve_quality", {}) or {}
+        key_ticks = curve.get("key_ticks", {}) or {}
+        social = payload.get("social_eclipse", {}) or {}
+        row = {
+            "seed": seed,
+            "output_dir": str(run_dir),
+            "pretty_score": str(_compute_pretty_score(payload)),
+            "early_near_zero": bool(curve.get("early_near_zero", False)),
+            "ust_price_t1": _extract_curve_tick_price(key_ticks, "1"),
+            "ust_price_t3": _extract_curve_tick_price(key_ticks, "3"),
+            "ust_price_t6": _extract_curve_tick_price(key_ticks, "6"),
+            "ust_price_t10": _extract_curve_tick_price(key_ticks, "10"),
+            "retail_success_raw": str(social.get("retail_tx_success_rate_window", "")),
+            "retail_success_executable": str(
+                social.get("retail_tx_success_rate_executable_window", "")
+            ),
+            "attacker_success_raw": str(social.get("attacker_tx_success_rate_window", "")),
+            "attacker_success_executable": str(
+                social.get("attacker_tx_success_rate_executable_window", "")
+            ),
+            "attacker_capped": str(social.get("attacker_capped_in_window", "")),
+            "attacker_min_effective_gas": str(
+                social.get("attacker_min_effective_gas_in_window", "")
+            ),
+        }
+        rows.append(row)
+
+    rows.sort(key=lambda x: Decimal(str(x.get("pretty_score", "0"))), reverse=True)
+    best_seed = rows[0]["seed"] if rows else None
+
+    sweep_json = root_output / "seed_sweep_summary.json"
+    sweep_csv = root_output / "seed_sweep_summary.csv"
+    sweep_payload = {
+        "root_output": str(root_output),
+        "seeds": seeds,
+        "runs_total": len(seeds),
+        "runs_success": len(rows),
+        "runs_failed": len(failures),
+        "best_seed_by_pretty_score": best_seed,
+        "rows": rows,
+        "failures": failures,
+    }
+    sweep_json.write_text(json.dumps(sweep_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    fieldnames = [
+        "seed",
+        "output_dir",
+        "pretty_score",
+        "early_near_zero",
+        "ust_price_t1",
+        "ust_price_t3",
+        "ust_price_t6",
+        "ust_price_t10",
+        "retail_success_raw",
+        "retail_success_executable",
+        "attacker_success_raw",
+        "attacker_success_executable",
+        "attacker_capped",
+        "attacker_min_effective_gas",
+    ]
+    with sweep_csv.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: row.get(key, "") for key in fieldnames})
+
+    print(
+        "[SEED-SWEEP] completed | success=%d failed=%d best_seed=%s csv=%s json=%s"
+        % (len(rows), len(failures), str(best_seed), str(sweep_csv), str(sweep_json)),
+        flush=True,
+    )
+    return 0 if not failures else 2
+
+
+def _classify_receipt_reason(error_code: Any) -> str:
+    code = str(error_code or "").strip()
+    if code == "SlippageExceededError":
+        return "slippage"
+    if code in BALANCE_ERRORS:
+        return "balance"
+    if code in {"ActionValidationError", "PermissionError", "ValueError"}:
+        return "validation"
+    if code == "InvariantViolationError":
+        return "invariant"
+    if code == "congestion":
+        return "congestion"
+    return "other"
+
+
+def _build_eval_retail_budget(
+    orchestrator: Simulation_Orchestrator,
+    retail_agents: list[str],
+) -> tuple[dict[str, dict[str, Decimal]], bool]:
+    snapshot = orchestrator.engine.get_state_snapshot()
+    accounts = snapshot.get("accounts", {})
+    budget: dict[str, dict[str, Decimal]] = {}
+    for agent in retail_agents:
+        data = accounts.get(agent, {})
+        budget[agent] = {
+            "UST": Decimal(str(data.get("UST", "0"))),
+            "LUNA": Decimal(str(data.get("LUNA", "0"))),
+            "USDC": Decimal(str(data.get("USDC", "0"))),
+        }
+    minting_allowed = bool(snapshot.get("engine_config", {}).get("minting_allowed", True))
+    return budget, minting_allowed
+
+
+def _submit_eval_retail_tx(
+    orchestrator: Simulation_Orchestrator,
+    *,
+    actor: str,
+    budget: dict[str, dict[str, Decimal]],
+    minting_allowed: bool,
+    gas_int: int,
+) -> bool:
+    token_budget = budget.get(actor)
+    if token_budget is None:
+        return False
+
+    gas = Decimal(gas_int)
+
+    def _max_affordable(token: str, *, min_amount: int) -> int | None:
+        available = Decimal(str(token_budget.get(token, Decimal("0")))) - gas
+        if available < Decimal(min_amount):
+            return None
+        upper = int(available)
+        if upper < min_amount:
+            return None
+        return upper
+
+    options: list[tuple[str, dict[str, str], str, Decimal]] = []
+
+    ust_swap_max = _max_affordable("UST", min_amount=5)
+    if ust_swap_max is not None:
+        amount = random.randint(5, min(60, ust_swap_max))
+        options.append(
+            (
+                "SWAP",
+                {
+                    "pool_name": "Pool_A",
+                    "token_in": "UST",
+                    "amount": str(amount),
+                    "slippage_tolerance": "0.50",
+                },
+                "UST",
+                Decimal(amount),
+            )
+        )
+
+    if minting_allowed:
+        ust_mint_max = _max_affordable("UST", min_amount=5)
+        if ust_mint_max is not None:
+            amount = random.randint(5, min(40, ust_mint_max))
+            options.append(
+                (
+                    "UST_TO_LUNA",
+                    {"amount_ust": str(amount)},
+                    "UST",
+                    Decimal(amount),
+                )
+            )
+
+    luna_to_ust_max = _max_affordable("LUNA", min_amount=1)
+    if luna_to_ust_max is not None:
+        amount = random.randint(1, min(20, luna_to_ust_max))
+        options.append(
+            (
+                "LUNA_TO_UST",
+                {"amount_luna": str(amount)},
+                "LUNA",
+                Decimal(amount),
+            )
+        )
+
+    luna_swap_max = _max_affordable("LUNA", min_amount=1)
+    if luna_swap_max is not None:
+        amount = random.randint(1, min(60, luna_swap_max))
+        options.append(
+            (
+                "SWAP",
+                {
+                    "pool_name": "Pool_B",
+                    "token_in": "LUNA",
+                    "amount": str(amount),
+                    "slippage_tolerance": "0.50",
+                },
+                "LUNA",
+                Decimal(amount),
+            )
+        )
+
+    usdc_swap_max = _max_affordable("USDC", min_amount=5)
+    if usdc_swap_max is not None:
+        amount = random.randint(5, min(60, usdc_swap_max))
+        options.append(
+            (
+                "SWAP",
+                {
+                    "pool_name": "Pool_B",
+                    "token_in": "USDC",
+                    "amount": str(amount),
+                    "slippage_tolerance": "0.50",
+                },
+                "USDC",
+                Decimal(amount),
+            )
+        )
+
+    if not options:
+        return False
+
+    action_type, params, principal_token, principal_amount = random.choice(options)
+    try:
+        orchestrator.submit_transaction(
+            actor,
+            action_type,
+            params,
+            gas_price=str(gas_int),
+        )
+    except Exception:  # noqa: BLE001
+        return False
+
+    token_budget[principal_token] = (
+        Decimal(str(token_budget.get(principal_token, Decimal("0"))))
+        - principal_amount
+        - gas
+    )
+    if token_budget[principal_token] < Decimal("0"):
+        token_budget[principal_token] = Decimal("0")
+    return True
 
 
 def _parse_positive_decimal(raw: Any, *, field_name: str) -> Decimal:
@@ -782,10 +1189,19 @@ def simulate(
     eclipse_window_ticks: int = 5,
     eclipse_fud_message: str = DEFAULT_ECLIPSE_FUD_MESSAGE,
     eclipse_sell_ust: Decimal = Decimal("300000"),
+    traffic_profile: str = "stress",
+    governance_hijack_attack: bool = False,
+    hijack_attacker_id: str = "whale_1",
+    hijack_trigger_tick: int = 2,
+    hijack_proposal_text: str = "Lower swap fee to 0.0001 for holder growth",
+    hijack_force_approve: bool = True,
 ) -> dict[str, Any]:
     retail_agents = [name for name in agents if role_of(name, role_map) == "retail"]
     if not retail_agents:
         raise ValueError("at least one retail agent is required")
+    profile = str(traffic_profile).strip().lower()
+    if profile not in TRAFFIC_PROFILE_CHOICES:
+        raise ValueError(f"traffic_profile must be one of: {TRAFFIC_PROFILE_CHOICES}")
 
     proposal_id: str | None = None
     llm_calls_total = 0
@@ -801,11 +1217,25 @@ def simulate(
         "project_reject_reason": None,
         "project_proposal_id": None,
     }
+    hijack_stats: dict[str, Any] = {
+        "enabled": bool(governance_hijack_attack),
+        "attacker_id": str(hijack_attacker_id),
+        "trigger_tick": int(hijack_trigger_tick),
+        "proposal_text": str(hijack_proposal_text),
+        "proposal_id": None,
+        "proposal_submitted": False,
+        "proposal_rejected": False,
+        "proposal_reject_reason": None,
+        "votes_submitted": 0,
+        "votes_failed": 0,
+        "force_approve": bool(hijack_force_approve),
+    }
     eclipse_window_start = int(eclipse_trigger_tick)
     eclipse_window_end = int(eclipse_trigger_tick) + int(eclipse_window_ticks) - 1
     eclipse_stats: dict[str, Any] = {
         "enabled": bool(social_eclipse_attack),
         "attacker_id": eclipse_attacker_id,
+        "traffic_profile": profile,
         "trigger_tick": int(eclipse_trigger_tick),
         "window_ticks": int(eclipse_window_ticks),
         "window_start_tick": int(eclipse_window_start),
@@ -815,26 +1245,66 @@ def simulate(
         "tx_failed_sum_window": 0,
         "mempool_congestion_peak_window": 0,
         "attacker_settled_count_window": 0,
+        "attacker_attempted_count_window": 0,
+        "attacker_failed_congestion_like_window": 0,
         "attacker_success_count_window": 0,
         "attacker_gas_paid_sum_window": "0",
         "retail_settled_count_window": 0,
+        "retail_attempted_count_window": 0,
+        "retail_failed_congestion_like_window": 0,
         "retail_success_count_window": 0,
         "retail_gas_paid_sum_window": "0",
         "attacker_tx_success_rate_window": "0",
+        "attacker_tx_success_rate_executable_window": "0",
         "retail_tx_success_rate_window": "0",
+        "retail_tx_success_rate_executable_window": "0",
         "attacker_vs_retail_success_rate_gap_window": "0",
+        "attacker_vs_retail_success_rate_gap_executable_window": "0",
         "avg_gas_paid_attacker_window": "0",
         "avg_gas_paid_retail_window": "0",
         "avg_gas_paid_gap_window": "0",
         "max_gas_bid_in_window": "0",
         "max_gas_bid_attacker_in_window": "0",
         "max_gas_bid_retail_in_window": "0",
+        "attacker_capped_in_window": False,
+        "attacker_min_effective_gas_in_window": None,
+        "attacker_first_cap_tick": None,
     }
     attacker_gas_paid_sum = Decimal("0")
     retail_gas_paid_sum = Decimal("0")
     max_gas_bid_window = Decimal("0")
     max_gas_bid_attacker_window = Decimal("0")
     max_gas_bid_retail_window = Decimal("0")
+    capped_tx_count_total = 0
+    attacker_capped_tx_count_total = 0
+    capped_tx_count_window = 0
+    attacker_capped_tx_count_window = 0
+    attacker_min_effective_gas_window: Decimal | None = None
+    attacker_first_cap_tick: int | None = None
+    failed_reason_totals: dict[str, int] = {
+        "slippage": 0,
+        "balance": 0,
+        "validation": 0,
+        "invariant": 0,
+        "congestion": 0,
+        "other": 0,
+    }
+    failed_reason_window: dict[str, int] = {
+        "slippage": 0,
+        "balance": 0,
+        "validation": 0,
+        "invariant": 0,
+        "congestion": 0,
+        "other": 0,
+    }
+    retail_failed_reason_window: dict[str, int] = {
+        "slippage": 0,
+        "balance": 0,
+        "validation": 0,
+        "invariant": 0,
+        "congestion": 0,
+        "other": 0,
+    }
 
     conn = sqlite3.connect(orchestrator.engine.get_db_path())
     try:
@@ -937,6 +1407,53 @@ def simulate(
                             str(placeholder_id),
                         )
 
+            if governance_hijack_attack and tick == int(hijack_trigger_tick) - 1:
+                try:
+                    hijack_proposal_id = orchestrator.submit_event(
+                        hijack_attacker_id,
+                        "PROPOSE",
+                        {"proposal_text": str(hijack_proposal_text)},
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    hijack_stats["proposal_rejected"] = True
+                    hijack_stats["proposal_reject_reason"] = str(exc)
+                    logger.info(
+                        "[HIJACK] malicious proposal rejected | attacker=%s | reason=%s",
+                        str(hijack_attacker_id),
+                        str(exc),
+                    )
+                else:
+                    hijack_stats["proposal_id"] = hijack_proposal_id
+                    hijack_stats["proposal_submitted"] = True
+                    logger.info(
+                        "[HIJACK] malicious proposal accepted | attacker=%s | proposal=%s",
+                        str(hijack_attacker_id),
+                        str(hijack_proposal_id),
+                    )
+                    if bool(hijack_force_approve):
+                        voters = list(agents)
+                        for voter in voters:
+                            try:
+                                orchestrator.submit_event(
+                                    voter,
+                                    "VOTE",
+                                    {
+                                        "proposal_id": hijack_proposal_id,
+                                        "decision": "approve",
+                                    },
+                                )
+                            except Exception:  # noqa: BLE001
+                                hijack_stats["votes_failed"] = int(hijack_stats["votes_failed"]) + 1
+                            else:
+                                hijack_stats["votes_submitted"] = int(
+                                    hijack_stats["votes_submitted"]
+                                ) + 1
+                        logger.info(
+                            "[HIJACK] force-approve votes submitted=%d failed=%d",
+                            int(hijack_stats["votes_submitted"]),
+                            int(hijack_stats["votes_failed"]),
+                        )
+
             # Governance stream
             if tick == 1:
                 try:
@@ -990,39 +1507,61 @@ def simulate(
                 },
             )
 
-            # Economic stream (intentionally overloaded > max_tx_per_tick)
-            for _ in range(orchestrator.max_tx_per_tick + 25):
-                actor = random.choice(retail_agents)
-                action = random.choice(["SWAP", "UST_TO_LUNA", "LUNA_TO_UST"])
-                gas = random.randint(1, 20)
-                if action == "SWAP":
-                    pool = random.choice(["Pool_A", "Pool_B"])
-                    token_in = "UST" if pool == "Pool_A" else random.choice(["LUNA", "USDC"])
-                    orchestrator.submit_transaction(
-                        actor,
-                        "SWAP",
-                        {
-                            "pool_name": pool,
-                            "token_in": token_in,
-                            "amount": str(random.randint(5, 60)),
-                            "slippage_tolerance": "0.15",
-                        },
-                        gas_price=str(gas),
-                    )
-                elif action == "UST_TO_LUNA":
-                    orchestrator.submit_transaction(
-                        actor,
-                        "UST_TO_LUNA",
-                        {"amount_ust": str(random.randint(5, 40))},
-                        gas_price=str(gas),
-                    )
-                else:
-                    orchestrator.submit_transaction(
-                        actor,
-                        "LUNA_TO_UST",
-                        {"amount_luna": str(random.randint(1, 20))},
-                        gas_price=str(gas),
-                    )
+            # Economic stream (intentionally overloaded > max_tx_per_tick).
+            target_submissions = orchestrator.max_tx_per_tick + 25
+            if profile == "eval":
+                retail_budget, minting_allowed = _build_eval_retail_budget(
+                    orchestrator,
+                    retail_agents,
+                )
+                submitted = 0
+                attempts = 0
+                max_attempts = target_submissions * 4
+                while submitted < target_submissions and attempts < max_attempts:
+                    attempts += 1
+                    actor = random.choice(retail_agents)
+                    gas = random.randint(1, 20)
+                    if _submit_eval_retail_tx(
+                        orchestrator,
+                        actor=actor,
+                        budget=retail_budget,
+                        minting_allowed=minting_allowed,
+                        gas_int=gas,
+                    ):
+                        submitted += 1
+            else:
+                for _ in range(target_submissions):
+                    actor = random.choice(retail_agents)
+                    action = random.choice(["SWAP", "UST_TO_LUNA", "LUNA_TO_UST"])
+                    gas = random.randint(1, 20)
+                    if action == "SWAP":
+                        pool = random.choice(["Pool_A", "Pool_B"])
+                        token_in = "UST" if pool == "Pool_A" else random.choice(["LUNA", "USDC"])
+                        orchestrator.submit_transaction(
+                            actor,
+                            "SWAP",
+                            {
+                                "pool_name": pool,
+                                "token_in": token_in,
+                                "amount": str(random.randint(5, 60)),
+                                "slippage_tolerance": "0.15",
+                            },
+                            gas_price=str(gas),
+                        )
+                    elif action == "UST_TO_LUNA":
+                        orchestrator.submit_transaction(
+                            actor,
+                            "UST_TO_LUNA",
+                            {"amount_ust": str(random.randint(5, 40))},
+                            gas_price=str(gas),
+                        )
+                    else:
+                        orchestrator.submit_transaction(
+                            actor,
+                            "LUNA_TO_UST",
+                            {"amount_luna": str(random.randint(1, 20))},
+                            gas_price=str(gas),
+                        )
 
             runtime_report = runtime.run_tick(max_inbox_size=max_inbox_size)
             report = runtime_report.settlement
@@ -1060,6 +1599,14 @@ def simulate(
             _log_whale_actions(logger, orchestrator, report)
             _log_governance_exec(logger, report)
 
+            for reason, cnt in report.failed_reason_counts.items():
+                failed_reason_totals[reason] = failed_reason_totals.get(reason, 0) + int(cnt)
+            for item in report.receipts:
+                if Decimal(item.gas_effective) < Decimal(item.gas_bid):
+                    capped_tx_count_total += 1
+                    if item.agent_id == eclipse_attacker_id:
+                        attacker_capped_tx_count_total += 1
+
             if eclipse_window_start <= int(report.tick) <= eclipse_window_end:
                 failed_now = sum(1 for item in report.receipts if item.status == "failed")
                 eclipse_stats["tx_failed_sum_window"] = int(
@@ -1069,9 +1616,48 @@ def simulate(
                     int(eclipse_stats["mempool_congestion_peak_window"]),
                     int(report.mempool_congestion),
                 )
+                dropped_meta = list(report.congestion_dropped_meta)
+                dropped_ids = [str(item.get("agent_id", "")) for item in dropped_meta]
+                retail_dropped = 0
+                attacker_dropped = 0
+                for meta in dropped_meta:
+                    dropped_id = str(meta.get("agent_id", ""))
+                    if dropped_id == eclipse_attacker_id:
+                        attacker_dropped += 1
+                        raw_gas = Decimal(str(meta.get("raw_gas", "0")))
+                        effective_gas = Decimal(str(meta.get("effective_gas", "0")))
+                        if effective_gas < raw_gas:
+                            capped_tx_count_window += 1
+                            attacker_capped_tx_count_window += 1
+                            attacker_min_effective_gas_window = (
+                                effective_gas
+                                if attacker_min_effective_gas_window is None
+                                else min(attacker_min_effective_gas_window, effective_gas)
+                            )
+                            if attacker_first_cap_tick is None:
+                                attacker_first_cap_tick = int(report.tick)
+                    elif role_of(dropped_id, role_map) == "retail":
+                        retail_dropped += 1
+                eclipse_stats["retail_attempted_count_window"] = int(
+                    eclipse_stats["retail_attempted_count_window"]
+                ) + int(retail_dropped)
+                eclipse_stats["retail_failed_congestion_like_window"] = int(
+                    eclipse_stats["retail_failed_congestion_like_window"]
+                ) + int(retail_dropped)
+                eclipse_stats["attacker_attempted_count_window"] = int(
+                    eclipse_stats["attacker_attempted_count_window"]
+                ) + int(attacker_dropped)
+                eclipse_stats["attacker_failed_congestion_like_window"] = int(
+                    eclipse_stats["attacker_failed_congestion_like_window"]
+                ) + int(attacker_dropped)
                 for item in report.receipts:
                     max_gas_bid_window = max(max_gas_bid_window, Decimal(item.gas_bid))
+                    if Decimal(item.gas_effective) < Decimal(item.gas_bid):
+                        capped_tx_count_window += 1
                     if item.agent_id == eclipse_attacker_id:
+                        eclipse_stats["attacker_attempted_count_window"] = int(
+                            eclipse_stats["attacker_attempted_count_window"]
+                        ) + 1
                         eclipse_stats["attacker_settled_count_window"] = int(
                             eclipse_stats["attacker_settled_count_window"]
                         ) + 1
@@ -1079,12 +1665,30 @@ def simulate(
                             eclipse_stats["attacker_success_count_window"] = int(
                                 eclipse_stats["attacker_success_count_window"]
                             ) + 1
+                        elif item.status == "failed":
+                            attacker_reason = _classify_receipt_reason(item.error_code)
+                            if attacker_reason == "congestion":
+                                eclipse_stats["attacker_failed_congestion_like_window"] = int(
+                                    eclipse_stats["attacker_failed_congestion_like_window"]
+                                ) + 1
                         attacker_gas_paid_sum += Decimal(item.gas_paid)
+                        if Decimal(item.gas_effective) < Decimal(item.gas_bid):
+                            attacker_capped_tx_count_window += 1
+                            attacker_min_effective_gas_window = (
+                                Decimal(item.gas_effective)
+                                if attacker_min_effective_gas_window is None
+                                else min(attacker_min_effective_gas_window, Decimal(item.gas_effective))
+                            )
+                            if attacker_first_cap_tick is None:
+                                attacker_first_cap_tick = int(report.tick)
                         max_gas_bid_attacker_window = max(
                             max_gas_bid_attacker_window,
                             Decimal(item.gas_bid),
                         )
                     elif role_of(item.agent_id, role_map) == "retail":
+                        eclipse_stats["retail_attempted_count_window"] = int(
+                            eclipse_stats["retail_attempted_count_window"]
+                        ) + 1
                         eclipse_stats["retail_settled_count_window"] = int(
                             eclipse_stats["retail_settled_count_window"]
                         ) + 1
@@ -1097,38 +1701,110 @@ def simulate(
                             max_gas_bid_retail_window,
                             Decimal(item.gas_bid),
                         )
+                        if item.status == "failed":
+                            reason = _classify_receipt_reason(item.error_code)
+                            retail_failed_reason_window[reason] = (
+                                retail_failed_reason_window.get(reason, 0) + 1
+                            )
+                            if reason == "congestion":
+                                eclipse_stats["retail_failed_congestion_like_window"] = int(
+                                    eclipse_stats["retail_failed_congestion_like_window"]
+                                ) + 1
+                for reason, cnt in report.failed_reason_counts.items():
+                    failed_reason_window[reason] = failed_reason_window.get(reason, 0) + int(cnt)
+                if int(report.congestion_dropped_retail_count) > 0:
+                    retail_failed_reason_window["congestion"] = (
+                        retail_failed_reason_window.get("congestion", 0)
+                        + int(report.congestion_dropped_retail_count)
+                    )
     finally:
         conn.close()
 
     attacker_settled = Decimal(str(eclipse_stats["attacker_settled_count_window"]))
+    attacker_attempted = Decimal(str(eclipse_stats["attacker_attempted_count_window"]))
+    attacker_failed_congestion_like = Decimal(
+        str(eclipse_stats["attacker_failed_congestion_like_window"])
+    )
     attacker_success = Decimal(str(eclipse_stats["attacker_success_count_window"]))
     retail_settled = Decimal(str(eclipse_stats["retail_settled_count_window"]))
+    retail_attempted = Decimal(str(eclipse_stats["retail_attempted_count_window"]))
+    retail_failed_congestion_like = Decimal(
+        str(eclipse_stats["retail_failed_congestion_like_window"])
+    )
     retail_success = Decimal(str(eclipse_stats["retail_success_count_window"]))
 
+    attacker_raw_denominator = attacker_attempted if attacker_attempted > 0 else attacker_settled
+    retail_raw_denominator = retail_attempted if retail_attempted > 0 else retail_settled
     attacker_success_rate = (
-        Decimal("0") if attacker_settled <= 0 else attacker_success / attacker_settled
+        Decimal("0") if attacker_raw_denominator <= 0 else attacker_success / attacker_raw_denominator
     )
     retail_success_rate = (
-        Decimal("0") if retail_settled <= 0 else retail_success / retail_settled
+        Decimal("0") if retail_raw_denominator <= 0 else retail_success / retail_raw_denominator
     )
     avg_gas_attacker = (
         Decimal("0") if attacker_settled <= 0 else attacker_gas_paid_sum / attacker_settled
     )
     avg_gas_retail = Decimal("0") if retail_settled <= 0 else retail_gas_paid_sum / retail_settled
+    attacker_executable_denominator = attacker_attempted - attacker_failed_congestion_like
+    if attacker_executable_denominator < 0:
+        attacker_executable_denominator = Decimal("0")
+    retail_executable_denominator = retail_attempted - retail_failed_congestion_like
+    if retail_executable_denominator < 0:
+        retail_executable_denominator = Decimal("0")
+    attacker_executable_success_rate = (
+        Decimal("0")
+        if attacker_executable_denominator <= 0
+        else attacker_success / attacker_executable_denominator
+    )
+    retail_executable_success_rate = (
+        Decimal("0")
+        if retail_executable_denominator <= 0
+        else retail_success / retail_executable_denominator
+    )
 
     eclipse_stats["attacker_gas_paid_sum_window"] = str(attacker_gas_paid_sum)
     eclipse_stats["retail_gas_paid_sum_window"] = str(retail_gas_paid_sum)
     eclipse_stats["attacker_tx_success_rate_window"] = str(attacker_success_rate)
+    eclipse_stats["attacker_tx_success_rate_executable_window"] = str(
+        attacker_executable_success_rate
+    )
     eclipse_stats["retail_tx_success_rate_window"] = str(retail_success_rate)
+    eclipse_stats["retail_tx_success_rate_executable_window"] = str(
+        retail_executable_success_rate
+    )
     eclipse_stats["attacker_vs_retail_success_rate_gap_window"] = str(
         attacker_success_rate - retail_success_rate
     )
+    eclipse_stats["attacker_vs_retail_success_rate_gap_executable_window"] = str(
+        attacker_executable_success_rate - retail_executable_success_rate
+    )
+    eclipse_stats["attacker_raw_denominator_window"] = str(attacker_raw_denominator)
+    eclipse_stats["retail_raw_denominator_window"] = str(retail_raw_denominator)
+    eclipse_stats["attacker_executable_denominator_window"] = str(attacker_executable_denominator)
+    eclipse_stats["retail_executable_denominator_window"] = str(retail_executable_denominator)
     eclipse_stats["avg_gas_paid_attacker_window"] = str(avg_gas_attacker)
     eclipse_stats["avg_gas_paid_retail_window"] = str(avg_gas_retail)
     eclipse_stats["avg_gas_paid_gap_window"] = str(avg_gas_attacker - avg_gas_retail)
     eclipse_stats["max_gas_bid_in_window"] = str(max_gas_bid_window)
     eclipse_stats["max_gas_bid_attacker_in_window"] = str(max_gas_bid_attacker_window)
     eclipse_stats["max_gas_bid_retail_in_window"] = str(max_gas_bid_retail_window)
+    eclipse_stats["capped_tx_count_window"] = int(capped_tx_count_window)
+    eclipse_stats["attacker_capped_tx_count_window"] = int(attacker_capped_tx_count_window)
+    eclipse_stats["capped_tx_count_total"] = int(capped_tx_count_total)
+    eclipse_stats["attacker_capped_tx_count_total"] = int(attacker_capped_tx_count_total)
+    eclipse_stats["attacker_capped_in_window"] = bool(attacker_capped_tx_count_window > 0)
+    eclipse_stats["attacker_min_effective_gas_in_window"] = (
+        str(attacker_min_effective_gas_window)
+        if attacker_min_effective_gas_window is not None
+        else None
+    )
+    eclipse_stats["attacker_first_cap_tick"] = attacker_first_cap_tick
+    eclipse_stats["failed_reason_window"] = {
+        key: int(value) for key, value in failed_reason_window.items()
+    }
+    eclipse_stats["retail_failed_reason_window"] = {
+        key: int(value) for key, value in retail_failed_reason_window.items()
+    }
 
     return {
         "llm_calls_total": llm_calls_total,
@@ -1137,7 +1813,9 @@ def simulate(
         "ticks": ticks,
         "ust_price_by_tick": ust_price_by_tick,
         "governance_dos": dos_stats,
+        "governance_hijack": hijack_stats,
         "social_eclipse": eclipse_stats,
+        "failed_reason_totals": {key: int(value) for key, value in failed_reason_totals.items()},
     }
 
 
@@ -1226,10 +1904,22 @@ def generate_social_eclipse_comparison(
     base_eclipse = base_summary.get("social_eclipse", {})
     attacker_success_base = _as_decimal(base_eclipse.get("attacker_tx_success_rate_window", "0"))
     retail_success_base = _as_decimal(base_eclipse.get("retail_tx_success_rate_window", "0"))
+    attacker_success_exec_base = _as_decimal(
+        base_eclipse.get("attacker_tx_success_rate_executable_window", "0")
+    )
+    retail_success_exec_base = _as_decimal(
+        base_eclipse.get("retail_tx_success_rate_executable_window", "0")
+    )
     attacker_success_attack = _as_decimal(
         attack_eclipse.get("attacker_tx_success_rate_window", "0")
     )
     retail_success_attack = _as_decimal(attack_eclipse.get("retail_tx_success_rate_window", "0"))
+    attacker_success_exec_attack = _as_decimal(
+        attack_eclipse.get("attacker_tx_success_rate_executable_window", "0")
+    )
+    retail_success_exec_attack = _as_decimal(
+        attack_eclipse.get("retail_tx_success_rate_executable_window", "0")
+    )
 
     avg_gas_attacker_base = _as_decimal(base_eclipse.get("avg_gas_paid_attacker_window", "0"))
     avg_gas_retail_base = _as_decimal(base_eclipse.get("avg_gas_paid_retail_window", "0"))
@@ -1254,6 +1944,34 @@ def generate_social_eclipse_comparison(
     max_gas_bid_retail_attack = _as_decimal(
         attack_eclipse.get("max_gas_bid_retail_in_window", "0")
     )
+    capped_tx_count_base = _as_decimal(base_eclipse.get("capped_tx_count_window", "0"))
+    capped_tx_count_attack = _as_decimal(attack_eclipse.get("capped_tx_count_window", "0"))
+    attacker_capped_count_base = _as_decimal(
+        base_eclipse.get("attacker_capped_tx_count_window", "0")
+    )
+    attacker_capped_count_attack = _as_decimal(
+        attack_eclipse.get("attacker_capped_tx_count_window", "0")
+    )
+    attacker_capped_in_window_base = Decimal(
+        int(bool(base_eclipse.get("attacker_capped_in_window", False)))
+    )
+    attacker_capped_in_window_attack = Decimal(
+        int(bool(attack_eclipse.get("attacker_capped_in_window", False)))
+    )
+    attacker_min_effective_gas_base = _as_decimal(
+        base_eclipse.get("attacker_min_effective_gas_in_window", "0")
+    )
+    attacker_min_effective_gas_attack = _as_decimal(
+        attack_eclipse.get("attacker_min_effective_gas_in_window", "0")
+    )
+    attacker_first_cap_tick_base = _as_decimal(base_eclipse.get("attacker_first_cap_tick", "0"))
+    attacker_first_cap_tick_attack = _as_decimal(
+        attack_eclipse.get("attacker_first_cap_tick", "0")
+    )
+    failed_reason_base = base_eclipse.get("failed_reason_window", {})
+    failed_reason_attack = attack_eclipse.get("failed_reason_window", {})
+    retail_failed_base = base_eclipse.get("retail_failed_reason_window", {})
+    retail_failed_attack = attack_eclipse.get("retail_failed_reason_window", {})
 
     output_dir.mkdir(parents=True, exist_ok=True)
     csv_path = output_dir / "social_eclipse_comparison.csv"
@@ -1269,9 +1987,24 @@ def generate_social_eclipse_comparison(
         ("attacker_tx_success_rate_window", attacker_success_base, attacker_success_attack),
         ("retail_tx_success_rate_window", retail_success_base, retail_success_attack),
         (
+            "attacker_tx_success_rate_executable_window",
+            attacker_success_exec_base,
+            attacker_success_exec_attack,
+        ),
+        (
+            "retail_tx_success_rate_executable_window",
+            retail_success_exec_base,
+            retail_success_exec_attack,
+        ),
+        (
             "attacker_vs_retail_success_rate_gap_window",
             attacker_success_base - retail_success_base,
             attacker_success_attack - retail_success_attack,
+        ),
+        (
+            "attacker_vs_retail_success_rate_gap_executable_window",
+            attacker_success_exec_base - retail_success_exec_base,
+            attacker_success_exec_attack - retail_success_exec_attack,
         ),
         ("avg_gas_paid_attacker_window", avg_gas_attacker_base, avg_gas_attacker_attack),
         ("avg_gas_paid_retail_window", avg_gas_retail_base, avg_gas_retail_attack),
@@ -1290,6 +2023,47 @@ def generate_social_eclipse_comparison(
             "max_gas_bid_retail_in_window",
             max_gas_bid_retail_base,
             max_gas_bid_retail_attack,
+        ),
+        ("capped_tx_count_window", capped_tx_count_base, capped_tx_count_attack),
+        (
+            "attacker_capped_tx_count_window",
+            attacker_capped_count_base,
+            attacker_capped_count_attack,
+        ),
+        (
+            "attacker_capped_in_window",
+            attacker_capped_in_window_base,
+            attacker_capped_in_window_attack,
+        ),
+        (
+            "attacker_min_effective_gas_in_window",
+            attacker_min_effective_gas_base,
+            attacker_min_effective_gas_attack,
+        ),
+        (
+            "attacker_first_cap_tick",
+            attacker_first_cap_tick_base,
+            attacker_first_cap_tick_attack,
+        ),
+        (
+            "failed_reason_slippage_window",
+            _as_decimal(failed_reason_base.get("slippage", 0)),
+            _as_decimal(failed_reason_attack.get("slippage", 0)),
+        ),
+        (
+            "failed_reason_congestion_window",
+            _as_decimal(failed_reason_base.get("congestion", 0)),
+            _as_decimal(failed_reason_attack.get("congestion", 0)),
+        ),
+        (
+            "retail_failed_reason_slippage_window",
+            _as_decimal(retail_failed_base.get("slippage", 0)),
+            _as_decimal(retail_failed_attack.get("slippage", 0)),
+        ),
+        (
+            "retail_failed_reason_congestion_window",
+            _as_decimal(retail_failed_base.get("congestion", 0)),
+            _as_decimal(retail_failed_attack.get("congestion", 0)),
         ),
     ]
 
@@ -1326,6 +2100,67 @@ def generate_social_eclipse_comparison(
         str(json_path),
     )
     return {"csv": csv_path, "json": json_path}
+
+
+def write_run_window_metrics_csv(
+    *,
+    summary: dict[str, Any],
+    output_dir: Path,
+) -> Path:
+    social = summary.get("social_eclipse", {}) or {}
+    row = {
+        "scenario": summary.get("scenario"),
+        "seed": summary.get("seed"),
+        "traffic_profile": social.get("traffic_profile", summary.get("traffic_profile", "stress")),
+        "window_start_tick": social.get("window_start_tick"),
+        "window_end_tick": social.get("window_end_tick"),
+        "attacker_id": social.get("attacker_id"),
+        "attacker_tx_success_rate_window": social.get("attacker_tx_success_rate_window"),
+        "attacker_tx_success_rate_executable_window": social.get(
+            "attacker_tx_success_rate_executable_window"
+        ),
+        "retail_tx_success_rate_window": social.get("retail_tx_success_rate_window"),
+        "retail_tx_success_rate_executable_window": social.get(
+            "retail_tx_success_rate_executable_window"
+        ),
+        "attacker_vs_retail_success_rate_gap_window": social.get(
+            "attacker_vs_retail_success_rate_gap_window"
+        ),
+        "attacker_vs_retail_success_rate_gap_executable_window": social.get(
+            "attacker_vs_retail_success_rate_gap_executable_window"
+        ),
+        "attacker_attempted_count_window": social.get("attacker_attempted_count_window"),
+        "attacker_settled_count_window": social.get("attacker_settled_count_window"),
+        "attacker_failed_congestion_like_window": social.get(
+            "attacker_failed_congestion_like_window"
+        ),
+        "attacker_raw_denominator_window": social.get("attacker_raw_denominator_window"),
+        "attacker_executable_denominator_window": social.get(
+            "attacker_executable_denominator_window"
+        ),
+        "retail_attempted_count_window": social.get("retail_attempted_count_window"),
+        "retail_settled_count_window": social.get("retail_settled_count_window"),
+        "retail_failed_congestion_like_window": social.get("retail_failed_congestion_like_window"),
+        "retail_raw_denominator_window": social.get("retail_raw_denominator_window"),
+        "retail_executable_denominator_window": social.get(
+            "retail_executable_denominator_window"
+        ),
+        "avg_gas_paid_attacker_window": social.get("avg_gas_paid_attacker_window"),
+        "avg_gas_paid_retail_window": social.get("avg_gas_paid_retail_window"),
+        "max_gas_bid_in_window": social.get("max_gas_bid_in_window"),
+        "attacker_capped_in_window": social.get("attacker_capped_in_window"),
+        "attacker_capped_tx_count_window": social.get("attacker_capped_tx_count_window"),
+        "attacker_min_effective_gas_in_window": social.get(
+            "attacker_min_effective_gas_in_window"
+        ),
+        "attacker_first_cap_tick": social.get("attacker_first_cap_tick"),
+    }
+    path = output_dir / "run_window_metrics.csv"
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+        writer.writeheader()
+        writer.writerow(row)
+    return path
 
 
 def plot_metrics(metrics_csv: Path, output_png: Path) -> None:
@@ -1400,7 +2235,25 @@ def parse_args() -> argparse.Namespace:
         help="Simulation scenario preset.",
     )
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--seed-list",
+        type=str,
+        default=None,
+        help="Comma-separated seeds for batch run (e.g. 42,77,101). Use 'auto' for built-in pretty seed set.",
+    )
+    parser.add_argument(
+        "--best-looking-preset",
+        action="store_true",
+        help="Apply a tuned preset for staircase-style, publication-friendly curve shape.",
+    )
     parser.add_argument("--output-dir", type=str, default="artifacts/phase5")
+    parser.add_argument(
+        "--traffic-profile",
+        type=str,
+        choices=TRAFFIC_PROFILE_CHOICES,
+        default="stress",
+        help="Economic noise profile: stress=legacy mixed noise, eval=executable-priority retail flow.",
+    )
     parser.add_argument(
         "--prompt-profile-path",
         type=str,
@@ -1464,6 +2317,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=100,
         help="Simulation ticks per day.",
+    )
+    parser.add_argument(
+        "--max-tx-per-tick",
+        type=int,
+        default=50,
+        help="Execution throughput cap per tick.",
     )
     parser.add_argument(
         "--voting-window-ticks",
@@ -1572,6 +2431,11 @@ def parse_args() -> argparse.Namespace:
         help="AECB age normalization horizon in ticks.",
     )
     parser.add_argument(
+        "--mitigation-b-warm-start",
+        action="store_true",
+        help="Enable warm-start for mitigation-B so cap can apply from early ticks.",
+    )
+    parser.add_argument(
         "--social-eclipse-attack",
         action="store_true",
         help="Enable social-driven mempool eclipse attack (FUD + sell pressure).",
@@ -1636,6 +2500,40 @@ def parse_args() -> argparse.Namespace:
         help="Whale_1 UST sell amount during Governance-DoS trigger tick.",
     )
     parser.add_argument(
+        "--governance-hijack-attack",
+        action="store_true",
+        help="Enable governance hijack scenario: attacker proposes malicious parameter patch.",
+    )
+    parser.add_argument(
+        "--hijack-attacker-id",
+        type=str,
+        default="whale_1",
+        help="Attacker id for governance hijack scenario.",
+    )
+    parser.add_argument(
+        "--hijack-trigger-tick",
+        type=int,
+        default=2,
+        help="1-based tick for malicious proposal submission.",
+    )
+    parser.add_argument(
+        "--hijack-proposal-text",
+        type=str,
+        default="Lower swap fee to 0.0001 to maximize holder returns",
+        help="Malicious proposal text used in governance hijack scenario.",
+    )
+    parser.add_argument(
+        "--hijack-force-approve",
+        action="store_true",
+        help="Force all agents to cast approve votes for malicious proposal.",
+    )
+    parser.add_argument(
+        "--hijack-attacker-luna",
+        type=str,
+        default="4000",
+        help="Initial LUNA assigned to hijack attacker for proposal fee + voting control.",
+    )
+    parser.add_argument(
         "--no-paper-charts",
         action="store_true",
         help="Disable automatic paper-grade chart generation after simulation.",
@@ -1698,6 +2596,14 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    preset_overrides = _apply_best_looking_preset(args)
+    seed_list = _parse_seed_list(args.seed_list)
+    if seed_list:
+        if any(seed < 0 for seed in seed_list):
+            raise ValueError("seed-list must only contain non-negative integers")
+        exit_code = _run_multi_seed_sweep(args, seed_list, sys.argv[1:])
+        raise SystemExit(exit_code)
+
     if int(args.ticks) <= 0:
         raise ValueError("ticks must be > 0")
     if int(args.progress_interval) <= 0:
@@ -1706,6 +2612,8 @@ def main() -> None:
         raise ValueError("llm_max_concurrent must be > 0")
     if int(args.ticks_per_day) <= 0:
         raise ValueError("ticks_per_day must be > 0")
+    if int(args.max_tx_per_tick) <= 0:
+        raise ValueError("max-tx-per-tick must be > 0")
     if int(args.voting_window_ticks) <= 0:
         raise ValueError("voting_window_ticks must be > 0")
     if int(args.paper_chart_dpi) <= 0:
@@ -1716,6 +2624,8 @@ def main() -> None:
         raise ValueError("eclipse-trigger-tick must be > 0")
     if int(args.eclipse_window_ticks) <= 0:
         raise ValueError("eclipse-window-ticks must be > 0")
+    if int(args.hijack_trigger_tick) <= 0:
+        raise ValueError("hijack-trigger-tick must be > 0")
     if int(args.mitigation_b_age_norm_ticks) <= 0:
         raise ValueError("mitigation-b-age-norm-ticks must be > 0")
 
@@ -1725,6 +2635,9 @@ def main() -> None:
     retail_ust_cap = _parse_positive_decimal(args.retail_ust_cap, field_name="retail_ust_cap")
     dos_whale_luna = _parse_positive_decimal(args.dos_whale_luna, field_name="dos_whale_luna")
     dos_sell_ust = _parse_positive_decimal(args.dos_sell_ust, field_name="dos_sell_ust")
+    hijack_attacker_luna = _parse_positive_decimal(
+        args.hijack_attacker_luna, field_name="hijack_attacker_luna"
+    )
     eclipse_sell_ust = _parse_positive_decimal(args.eclipse_sell_ust, field_name="eclipse_sell_ust")
     mitigation_b_panic_threshold = Decimal(str(args.mitigation_b_panic_threshold))
     mitigation_b_gas_cap = _parse_positive_decimal(
@@ -1785,17 +2698,37 @@ def main() -> None:
             p.unlink()
 
     logger.info("[CONFIG] output_dir=%s", str(out_dir))
+    if preset_overrides:
+        logger.info(
+            "[CONFIG] best_looking_preset=on | overrides=%s",
+            json.dumps(preset_overrides, ensure_ascii=False),
+        )
+    else:
+        logger.info(
+            "[CONFIG] best_looking_preset=%s",
+            "on" if args.best_looking_preset else "off",
+        )
     logger.info("[CONFIG] log_file=%s", str(log_path))
     logger.info("[CONFIG] scenario=%s", args.scenario)
+    logger.info("[CONFIG] traffic_profile=%s", str(args.traffic_profile))
     logger.info(
         "[CONFIG] llm_max_concurrent=%s",
         str(args.llm_max_concurrent) if args.llm_max_concurrent is not None else "config-default",
     )
     logger.info("[CONFIG] ticks_per_day=%d", int(args.ticks_per_day))
+    logger.info("[CONFIG] max_tx_per_tick=%d", int(args.max_tx_per_tick))
     logger.info("[CONFIG] voting_window_ticks=%d", int(args.voting_window_ticks))
     logger.info(
         "[CONFIG] governance_dos_attack=%s",
         "on" if args.governance_dos_attack else "off",
+    )
+    logger.info(
+        "[CONFIG] governance_hijack_attack=%s | attacker=%s | trigger_tick=%d | force_approve=%s | attacker_luna=%s",
+        "on" if args.governance_hijack_attack else "off",
+        str(args.hijack_attacker_id),
+        int(args.hijack_trigger_tick),
+        "on" if args.hijack_force_approve else "off",
+        str(hijack_attacker_luna),
     )
     resolved_mitigation_mode = (
         str(args.mitigation_mode).strip().lower()
@@ -1807,13 +2740,14 @@ def main() -> None:
         resolved_mitigation_mode,
     )
     logger.info(
-        "[CONFIG] mitigation_b=%s | panic_threshold=%s | gas_cap=%s | gas_weight=%s | age_weight=%s | age_norm_ticks=%d",
+        "[CONFIG] mitigation_b=%s | panic_threshold=%s | gas_cap=%s | gas_weight=%s | age_weight=%s | age_norm_ticks=%d | warm_start=%s",
         "on" if args.enable_mitigation_b else "off",
         str(mitigation_b_panic_threshold),
         str(mitigation_b_gas_cap),
         str(mitigation_b_gas_weight),
         str(mitigation_b_age_weight),
         int(args.mitigation_b_age_norm_ticks),
+        "on" if args.mitigation_b_warm_start else "off",
     )
     logger.info(
         "[CONFIG] mitigation_b_role_bias retail=%s project=%s whale=%s",
@@ -1867,6 +2801,11 @@ def main() -> None:
         max_open_per_agent=governance_max_open_per_agent,
         mitigation_strategy=mitigation_strategy,
     )
+    mitigation_b_warm_start_ticks = (
+        int(args.eclipse_trigger_tick) + int(args.eclipse_window_ticks) - 1
+        if args.mitigation_b_warm_start
+        else 0
+    )
     execution_mitigation = (
         ExecutionCircuitBreaker(
             panic_threshold=mitigation_b_panic_threshold,
@@ -1874,6 +2813,7 @@ def main() -> None:
             gas_weight=mitigation_b_gas_weight,
             age_weight=mitigation_b_age_weight,
             age_norm_ticks=int(args.mitigation_b_age_norm_ticks),
+            warm_start_ticks=int(mitigation_b_warm_start_ticks),
             role_bias=mitigation_b_role_bias,
             logger=logger,
         )
@@ -1885,7 +2825,7 @@ def main() -> None:
         engine=engine,
         ticks_per_day=int(args.ticks_per_day),
         governance=governance,
-        max_tx_per_tick=50,
+        max_tx_per_tick=int(args.max_tx_per_tick),
         metrics_logger=metrics,
         state_checkpoint=checkpoints,
         execution_mitigation=execution_mitigation,
@@ -1928,6 +2868,17 @@ def main() -> None:
             str(dos_whale_luna),
             str(dos_sell_ust),
             int(governance_max_open_per_agent),
+        )
+    if args.governance_hijack_attack:
+        for item in bootstrap:
+            if item.agent_id == str(args.hijack_attacker_id):
+                if item.initial_luna < hijack_attacker_luna:
+                    item.initial_luna = hijack_attacker_luna
+                break
+        logger.info(
+            "[CONFIG] governance_hijack attacker balance adjusted | attacker=%s | initial_luna=%s",
+            str(args.hijack_attacker_id),
+            str(hijack_attacker_luna),
         )
     bootstrap_by_id = {item.agent_id: item for item in bootstrap}
     role_map = {item.agent_id: item.role for item in bootstrap}
@@ -1984,6 +2935,12 @@ def main() -> None:
             eclipse_window_ticks=int(args.eclipse_window_ticks),
             eclipse_fud_message=str(args.eclipse_fud_message),
             eclipse_sell_ust=eclipse_sell_ust,
+            traffic_profile=str(args.traffic_profile),
+            governance_hijack_attack=bool(args.governance_hijack_attack),
+            hijack_attacker_id=str(args.hijack_attacker_id),
+            hijack_trigger_tick=int(args.hijack_trigger_tick),
+            hijack_proposal_text=str(args.hijack_proposal_text),
+            hijack_force_approve=bool(args.hijack_force_approve),
         )
 
         curve_quality = _evaluate_curve_quality(
@@ -1997,6 +2954,8 @@ def main() -> None:
             "runtime_agents": len(runtime_agent_ids),
             "scenario": args.scenario,
             "seed": int(args.seed),
+            "traffic_profile": str(args.traffic_profile),
+            "max_tx_per_tick": int(args.max_tx_per_tick),
             "llm_mode": "offline_rules" if args.offline_rules else "api",
             "decision_calls_total": sim_stats["llm_calls_total"],
             "api_calls_total": sim_stats["api_calls_total"],
@@ -2023,6 +2982,8 @@ def main() -> None:
                 "gas_weight": str(mitigation_b_gas_weight),
                 "age_weight": str(mitigation_b_age_weight),
                 "age_norm_ticks": int(args.mitigation_b_age_norm_ticks),
+                "warm_start_enabled": bool(args.mitigation_b_warm_start),
+                "warm_start_ticks": int(mitigation_b_warm_start_ticks),
                 "role_bias": {
                     "retail": str(mitigation_b_role_bias["retail"]),
                     "project": str(mitigation_b_role_bias["project"]),
@@ -2031,7 +2992,9 @@ def main() -> None:
             },
             "curve_quality": curve_quality,
             "governance_dos": sim_stats.get("governance_dos", {}),
+            "governance_hijack": sim_stats.get("governance_hijack", {}),
             "social_eclipse": sim_stats.get("social_eclipse", {}),
+            "failed_reason_totals": sim_stats.get("failed_reason_totals", {}),
             "db": str(db_path),
             "metrics_csv": str(metrics_csv),
             "checkpoint_count": len(list(checkpoint_dir.glob("tick_*.json"))),
@@ -2039,6 +3002,12 @@ def main() -> None:
             "log_file": str(log_path),
         }
         summary_path = out_dir / "summary.json"
+        summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+        run_window_metrics_csv = write_run_window_metrics_csv(
+            summary=summary,
+            output_dir=out_dir,
+        )
+        summary["run_window_metrics_csv"] = str(run_window_metrics_csv)
         summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
         plot_path = out_dir / "phase5_dashboard.png"
@@ -2124,6 +3093,7 @@ def main() -> None:
         logger.info("[RUN] api_calls_total=%s", summary["api_calls_total"])
         logger.info("[RUN] db=%s", str(db_path))
         logger.info("[RUN] metrics=%s", str(metrics_csv))
+        logger.info("[RUN] run_window_metrics=%s", str(run_window_metrics_csv))
         logger.info("[RUN] checkpoints=%s", str(checkpoint_dir))
         logger.info("[RUN] plot=%s", str(plot_path))
         logger.info("[RUN] summary=%s", str(summary_path))

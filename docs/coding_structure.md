@@ -152,6 +152,11 @@ ACE-Sim 采用五层结构，从下到上分别是：
 2. 滑点失败不影响后续单。
 3. 系统不变量异常触发 `halted` 熔断。
 
+#### 5.3.5 评估流量模式（补充）
+1. `stress`：保持高压混合噪声（默认）。
+2. `eval`：优先生成可执行散户交易，用于衡量防御上限。
+3. 防御B支持 `warm-start`，可在首窗口提前生效并产生日志/账本证据。
+
 ---
 
 ## 6. 社会拓扑与信息信道设计（social）
@@ -278,7 +283,8 @@ ACE-Sim 采用五层结构，从下到上分别是：
 2. `tick_*.json`：全量状态快照。
 3. `summary.json`：本次实验总结。
 4. `phase5_dashboard.png`：可视化图。
-5. `logs/simulation_run.log`：统一运行日志。
+5. `run_window_metrics.csv`：窗口双口径指标快照。
+6. `logs/simulation_run.log`：统一运行日志。
 
 ---
 
@@ -313,6 +319,12 @@ ACE-Sim 采用五层结构，从下到上分别是：
 5. `governance_concentration`
 6. `mempool_congestion`
 7. `mempool_processed`
+
+窗口级补充（`summary.json` / `run_window_metrics.csv`）：
+1. `retail_tx_success_rate_window`
+2. `retail_tx_success_rate_executable_window`
+3. `attacker_capped_in_window`
+4. `attacker_min_effective_gas_in_window`
 
 定义原则：
 1. 指标口径必须固定，便于横向对比。

@@ -193,6 +193,15 @@
 | `--output-dir` | 路径（默认 `artifacts/phase5`） | 产物输出目录。 |
 | `--enable-mitigation-a` | 开关（默认关闭） | 启用防御A语义治理网关（快捷开关）。 |
 | `--mitigation-mode` | `none/semantic/priority/full`（默认 `none`） | 治理防御模式；非 `none` 时优先生效。 |
+| `--enable-mitigation-b` | 开关（默认关闭） | 启用防御B执行熔断器（AECB）。 |
+| `--mitigation-b-panic-threshold` | `Decimal>=0`（默认 `0.5`） | 防御B触发阈值。 |
+| `--mitigation-b-gas-cap` | 正数（默认 `50.0`） | 防御B危机模式下的有效 Gas 上限。 |
+| `--mitigation-b-gas-weight` | `Decimal>=0`（默认 `0.2`） | 防御B排序中的 Gas 权重。 |
+| `--mitigation-b-age-weight` | `Decimal>=0`（默认 `0.8`） | 防御B排序中的账户年龄权重。 |
+| `--mitigation-b-role-bias-retail/project/whale` | `Decimal`（默认 `1.0/0.6/0.2`） | 防御B角色偏置权重。 |
+| `--mitigation-b-age-norm-ticks` | `int>0`（默认 `100`） | 防御B年龄归一化窗口。 |
+| `--mitigation-b-warm-start` | 开关（默认关闭） | 让防御B在早期 tick 直接生效，用于首窗口限 Gas 评估。 |
+| `--traffic-profile` | `stress/eval`（默认 `stress`） | 交易噪声模式；`eval` 优先生成可执行散户交易。 |
 | `--prompt-profile-path` | JSON 路径或空 | 指定角色画像覆盖文件（常用于攻击实验）。 |
 | `--offline-rules` | 开关（默认关闭） | 启用离线规则模式（不走 API）。 |
 | `--llm-agent-count` | `int`（默认 `12`） | 由运行时控制的 agent 数量。 |
@@ -294,6 +303,18 @@
 | `--congestion-scale` | `linear` 或 `log`（默认 `log`） | 拥堵曲线坐标尺度。 |
 | `--strict-shape-check` | 开关（默认关闭） | L 型断崖时直接失败退出。 |
 | `--shape-report-json` | 路径或空 | 形态诊断 JSON 输出位置。 |
+
+### 9.8 `summary.json` / `run_window_metrics.csv` 关键口径字段
+
+| 参数名 | 可选参数（默认） | 作用 |
+|---|---|---|
+| `retail_tx_success_rate_window` | `0~1` | 原始口径：散户成功 / 散户尝试（包含拥堵失败影响）。 |
+| `retail_tx_success_rate_executable_window` | `0~1` | 有效口径：剔除拥堵失败后的散户成功率。 |
+| `attacker_tx_success_rate_window` | `0~1` | 攻击者原始口径成功率。 |
+| `attacker_tx_success_rate_executable_window` | `0~1` | 攻击者有效口径成功率。 |
+| `attacker_capped_in_window` | `True/False` | 观察窗口内是否出现攻击者被 cap。 |
+| `attacker_min_effective_gas_in_window` | `Decimal` 或空 | 窗口内攻击者最低有效 Gas。 |
+| `attacker_first_cap_tick` | `int` 或空 | 窗口内首次 cap 的 tick。 |
 
 ## 10. 建议优先调参顺序
 

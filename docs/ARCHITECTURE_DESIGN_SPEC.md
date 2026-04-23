@@ -42,6 +42,7 @@ ACE-Sim 采用五层架构：
 3. Mempool 抢跑规则：`gas_price` 降序，Gas 相同按 FIFO。
 4. Gas 成本规则：进入执行后扣费，滑点失败不退。
 5. 拥堵仿真：`max_tx_per_tick` 控制每 Tick 最大结算量，剩余交易留在 mempool。
+6. 可插拔执行防御（AECB）：支持 `warm-start` 提前触发，cap 与排序统一走 `effective_gas`。
 
 ### 3.3 社会传播层（Topology & Channels）
 路径：`src/ace_sim/social/`
@@ -144,7 +145,7 @@ ACE-Sim 采用五层架构：
 1. `ACE_Engine`：`minting_allowed`、`swap_fee`、`daily_mint_cap`。
 2. `Simulation_Orchestrator`：`ticks_per_day`、`max_tx_per_tick`、`default_max_inbox_size`。
 3. `GovernanceModule`：`proposal_fee_luna`、`max_open_proposals`、`max_open_per_agent`、`voting_window_ticks`、`quorum_ratio`。
-4. Phase 5 脚本参数：`--scenario`、`--pool-a-init`、`--shock-t1/--shock-t3/--shock-t6`、`--retail-ust-cap`、`--social-eclipse-attack`、`--governance-dos-attack`、`--enable-mitigation-a`、`--mitigation-mode`、`--ticks-per-day`、`--voting-window-ticks`、`--llm-max-concurrent`、`--no-progress`、`--progress-interval`、`--log-file`、`--log-level`。
+4. Phase 5 脚本参数：`--scenario`、`--pool-a-init`、`--shock-t1/--shock-t3/--shock-t6`、`--retail-ust-cap`、`--social-eclipse-attack`、`--governance-dos-attack`、`--enable-mitigation-a`、`--mitigation-mode`、`--enable-mitigation-b`、`--mitigation-b-warm-start`、`--traffic-profile`、`--ticks-per-day`、`--voting-window-ticks`、`--llm-max-concurrent`、`--no-progress`、`--progress-interval`、`--log-file`、`--log-level`。
 
 ## 6. 运行与复现实验
 说明：
@@ -226,13 +227,14 @@ python scripts/visualization/phase5_governance_visualizer.py --ticks 40 --retail
 
 ### 7.2 产物目录（Phase 5）
 1. `artifacts/phase5/metrics.csv`
-2. `artifacts/phase5/phase5_dashboard.png`
-3. `artifacts/phase5/summary.json`
-4. `artifacts/phase5/checkpoints/tick_*.json`
-5. `logs/simulation_run.log`
-6. `artifacts/phase5/paper_dashboard_2x2.(png|pdf)`
-7. `artifacts/phase5/chart1~chart4.(png|pdf)`
-8. `artifacts/phase5/shape_report.json`
+2. `artifacts/phase5/run_window_metrics.csv`（窗口双口径指标快照）
+3. `artifacts/phase5/phase5_dashboard.png`
+4. `artifacts/phase5/summary.json`
+5. `artifacts/phase5/checkpoints/tick_*.json`
+6. `logs/simulation_run.log`
+7. `artifacts/phase5/paper_dashboard_2x2.(png|pdf)`
+8. `artifacts/phase5/chart1~chart4.(png|pdf)`
+9. `artifacts/phase5/shape_report.json`
 
 补充说明：仓库默认 `.gitignore` 会忽略 `artifacts` 大体量产物与本地虚拟环境（`.venv/`、`venv/`），避免备份体积失控。
 
@@ -244,6 +246,10 @@ python scripts/visualization/phase5_governance_visualizer.py --ticks 40 --retail
 4. `governance_concentration`
 5. `mempool_congestion`
 6. `mempool_processed`
+
+窗口级补充（`summary.json` / `run_window_metrics.csv`）：
+1. `retail_tx_success_rate_window`（原始口径）
+2. `retail_tx_success_rate_executable_window`（剔除拥堵失败的有效口径）
 
 ## 9. 验收检查清单
 1. `pytest -q` 全部通过。

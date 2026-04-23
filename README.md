@@ -1,7 +1,7 @@
 ﻿# ACE-Sim: Web3 多智能体经济与治理安全仿真平台
 
 ![python](https://img.shields.io/badge/Python-3.10%2B-blue)
-![tests](https://img.shields.io/badge/Tests-69%20Passing-brightgreen)
+![tests](https://img.shields.io/badge/Tests-76%20Passing-brightgreen)
 ![phase](https://img.shields.io/badge/Phase-1~5-success)
 ![llm](https://img.shields.io/badge/LLM-API%20Default-orange)
 
@@ -158,6 +158,11 @@ python scripts/visualization/phase5_governance_visualizer.py --ticks 80 --retail
 python scripts/visualization/phase5_governance_visualizer.py --ticks 40 --retail 24 --scenario staircase_formal_run --governance-dos-attack --mitigation-mode semantic --output-dir artifacts/sagg40_demo --no-paper-charts
 ```
 
+### 6.10 AB 联防评估模式（新增）
+```bash
+python scripts/visualization/phase5_governance_visualizer.py --ticks 80 --retail 24 --scenario staircase_formal_run --traffic-profile eval --enable-mitigation-a --mitigation-mode semantic --enable-mitigation-b --mitigation-b-warm-start --mitigation-b-gas-cap 50 --social-eclipse-attack --eclipse-trigger-tick 1 --eclipse-window-ticks 5 --output-dir artifacts/ab_eval_api
+```
+
 ## 7. 日志与可观测性（Phase 5 增强）
 所有日志统一写入终端 + 文件（默认 `logs/simulation_run.log`）。
 
@@ -180,13 +185,14 @@ python scripts/visualization/phase5_governance_visualizer.py --ticks 40 --retail
 
 ### 8.2 输出目录（以 Phase 5 为例）
 1. `artifacts/phase5/metrics.csv`
-2. `artifacts/phase5/phase5_dashboard.png`
-3. `artifacts/phase5/summary.json`
-4. `artifacts/phase5/checkpoints/tick_*.json`
-5. `artifacts/phase5/paper_dashboard_2x2.(png|pdf)`
-6. `artifacts/phase5/chart1~chart4.(png|pdf)`
-7. `artifacts/phase5/shape_report.json`
-8. `paper/防御A治理效果.md`（防御A实验结果汇总表）
+2. `artifacts/phase5/run_window_metrics.csv`
+3. `artifacts/phase5/phase5_dashboard.png`
+4. `artifacts/phase5/summary.json`
+5. `artifacts/phase5/checkpoints/tick_*.json`
+6. `artifacts/phase5/paper_dashboard_2x2.(png|pdf)`
+7. `artifacts/phase5/chart1~chart4.(png|pdf)`
+8. `artifacts/phase5/shape_report.json`
+9. `paper/防御A治理效果.md`（防御A实验结果汇总表）
 
 ### 8.3 Git 备份注意事项（小补充）
 1. 默认不会把 `artifacts` 下的大体量实验产物提交到 Git。
@@ -201,6 +207,8 @@ python scripts/visualization/phase5_governance_visualizer.py --ticks 40 --retail
 4. `governance_concentration`
 5. `mempool_congestion`
 6. `mempool_processed`
+7. `retail_tx_success_rate_window`（原始口径，含拥堵）
+8. `retail_tx_success_rate_executable_window`（有效口径，剔除拥堵失败）
 
 ## 10. 复现实验建议
 1. 固定随机种子，跑多组重复实验。

@@ -89,6 +89,11 @@ class TickSettlementReport:
     governance_applied_updates: list[Any] = field(default_factory=list)
     mempool_processed: int = 0
     mempool_congestion: int = 0
+    congestion_dropped_count: int = 0
+    congestion_dropped_retail_count: int = 0
+    congestion_dropped_agent_ids: list[str] = field(default_factory=list)
+    congestion_dropped_meta: list[dict[str, str]] = field(default_factory=list)
+    failed_reason_counts: dict[str, int] = field(default_factory=dict)
 
 
 class Simulation_Orchestrator:
@@ -396,8 +401,10 @@ class Simulation_Orchestrator:
         for tx in batch_all:
             if tx.raw_gas_price is None:
                 tx.raw_gas_price = Decimal(str(tx.gas_price))
-            tx.effective_gas_price = Decimal(str(tx.raw_gas_price))
-            tx.mitigation_flags = []
+            if tx.effective_gas_price is None:
+                tx.effective_gas_price = Decimal(str(tx.raw_gas_price))
+            if tx.mitigation_flags is None:
+                tx.mitigation_flags = []
 
         if self.execution_mitigation is not None:
             account_roles: dict[str, str] = {}
@@ -431,8 +438,35 @@ class Simulation_Orchestrator:
         leftovers = batch_all[self.max_tx_per_tick :]
         if leftovers:
             self.mempool.extend(leftovers)
+        congestion_dropped_count = len(leftovers)
+        congestion_dropped_agent_ids = [str(tx.agent_id) for tx in leftovers]
+        congestion_dropped_meta = [
+            {
+                "tx_id": str(tx.tx_id),
+                "agent_id": str(tx.agent_id),
+                "raw_gas": str(tx.raw_gas_price),
+                "effective_gas": str(tx.effective_gas_price),
+            }
+            for tx in leftovers
+        ]
+        congestion_dropped_retail_count = 0
+        for tx in leftovers:
+            agent = str(tx.agent_id)
+            role = "retail"
+            if agent in self.topology.graph:
+                role = str(self.topology.graph.nodes[agent].get("role", "retail"))
+            if role == "retail":
+                congestion_dropped_retail_count += 1
 
         receipts: list[TxReceipt] = []
+        failed_reason_counts: dict[str, int] = {
+            "slippage": 0,
+            "balance": 0,
+            "validation": 0,
+            "invariant": 0,
+            "congestion": int(congestion_dropped_count),
+            "other": 0,
+        }
         for rank, tx in enumerate(batch):
             gas_token: str | None = None
             gas_paid = Decimal("0")
@@ -472,6 +506,7 @@ class Simulation_Orchestrator:
                     )
                 )
             except SlippageExceededError as exc:
+                failed_reason_counts["slippage"] += 1
                 receipts.append(
                     TxReceipt(
                         tx_id=tx.tx_id,
@@ -496,6 +531,8 @@ class Simulation_Orchestrator:
                 PermissionError,
                 ValueError,
             ) as exc:
+                reason_key = _classify_failed_reason(type(exc).__name__)
+                failed_reason_counts[reason_key] = failed_reason_counts.get(reason_key, 0) + 1
                 receipts.append(
                     TxReceipt(
                         tx_id=tx.tx_id,
@@ -514,6 +551,7 @@ class Simulation_Orchestrator:
                 )
                 continue
             except InvariantViolationError as exc:
+                failed_reason_counts["invariant"] += 1
                 receipts.append(
                     TxReceipt(
                         tx_id=tx.tx_id,
@@ -545,6 +583,11 @@ class Simulation_Orchestrator:
             governance_applied_updates=governance_applied_updates,
             mempool_processed=len(batch),
             mempool_congestion=len(self.mempool),
+            congestion_dropped_count=int(congestion_dropped_count),
+            congestion_dropped_retail_count=int(congestion_dropped_retail_count),
+            congestion_dropped_agent_ids=congestion_dropped_agent_ids,
+            congestion_dropped_meta=congestion_dropped_meta,
+            failed_reason_counts=failed_reason_counts,
         )
 
         if self.metrics_logger is not None:
@@ -621,6 +664,19 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, tuple):
         return [_jsonable(v) for v in value]
     return value
+
+
+def _classify_failed_reason(error_code: str) -> str:
+    code = str(error_code).strip()
+    if code == "SlippageExceededError":
+        return "slippage"
+    if code in {"InsufficientBalanceError", "InsufficientFundsError"}:
+        return "balance"
+    if code in {"ActionValidationError", "PermissionError", "ValueError"}:
+        return "validation"
+    if code == "InvariantViolationError":
+        return "invariant"
+    return "other"
 
 
 __all__ = [

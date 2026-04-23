@@ -299,3 +299,103 @@ def test_mitigation_b_fair_sort_prefers_retail_in_crisis(tmp_path):
 
     report = orchestrator.step_tick()
     assert [item.agent_id for item in report.receipts] == ["retail_0", "whale_0"]
+
+
+def test_mitigation_b_capped_effective_gas_persists_for_leftover_tx(tmp_path):
+    engine = new_engine(tmp_path)
+    engine.create_account("whale_1", ust="300")
+    engine.create_account("retail_1", ust="300")
+    mitigation = ExecutionCircuitBreaker(
+        panic_threshold=Decimal("0"),
+        crisis_gas_cap=Decimal("10"),
+        gas_weight=Decimal("0"),
+        age_weight=Decimal("1"),
+        role_bias={"retail": Decimal("2.0"), "project": Decimal("0"), "whale": Decimal("0")},
+    )
+    orchestrator = Simulation_Orchestrator(
+        engine,
+        execution_mitigation=mitigation,
+        max_tx_per_tick=1,
+    )
+    orchestrator.register_agent("whale_1", role="whale", community_id="c1")
+    orchestrator.register_agent("retail_1", role="retail", community_id="c0")
+    orchestrator._last_tick_panic_word_freq = Decimal("1")
+
+    orchestrator.submit_transaction(
+        "whale_1",
+        "UST_TO_LUNA",
+        {"amount_ust": "1"},
+        gas_price="100",
+    )
+    orchestrator.submit_transaction(
+        "retail_1",
+        "UST_TO_LUNA",
+        {"amount_ust": "1"},
+        gas_price="1",
+    )
+
+    report_tick1 = orchestrator.step_tick()
+    assert report_tick1.receipts[0].agent_id == "retail_1"
+    assert len(orchestrator.mempool) == 1
+    assert orchestrator.mempool[0].agent_id == "whale_1"
+    assert orchestrator.mempool[0].effective_gas_price == Decimal("10")
+
+    report_tick2 = orchestrator.step_tick()
+    assert report_tick2.receipts[0].agent_id == "whale_1"
+    assert report_tick2.receipts[0].gas_effective == Decimal("10")
+    assert orchestrator.protocol_fee_vault["UST"] == Decimal("11")
+
+
+def test_failed_reason_counts_include_congestion_and_slippage(tmp_path):
+    engine = new_engine(tmp_path)
+    engine.create_account("alice", ust="2000")
+    engine.create_account("bob", ust="2000")
+    engine.create_account("carol", ust="2000")
+    orchestrator = Simulation_Orchestrator(engine, max_tx_per_tick=2)
+
+    orchestrator.submit_transaction(
+        "alice",
+        "SWAP",
+        {"pool_name": "Pool_A", "token_in": "UST", "amount": "700", "slippage_tolerance": "0.9"},
+        gas_price="10",
+    )
+    orchestrator.submit_transaction(
+        "bob",
+        "SWAP",
+        {"pool_name": "Pool_A", "token_in": "UST", "amount": "700", "slippage_tolerance": "0"},
+        gas_price="9",
+    )
+    orchestrator.submit_transaction(
+        "carol",
+        "SWAP",
+        {"pool_name": "Pool_A", "token_in": "UST", "amount": "10", "slippage_tolerance": "0.9"},
+        gas_price="1",
+    )
+
+    report = orchestrator.step_tick()
+    assert report.failed_reason_counts["slippage"] >= 1
+    assert report.failed_reason_counts["congestion"] == 1
+    assert report.congestion_dropped_count == 1
+
+
+def test_mitigation_b_warm_start_caps_on_first_tick(tmp_path):
+    engine = new_engine(tmp_path)
+    engine.create_account("whale_1", ust="200")
+    mitigation = ExecutionCircuitBreaker(
+        panic_threshold=Decimal("0.9"),
+        crisis_gas_cap=Decimal("50"),
+        warm_start_ticks=5,
+    )
+    orchestrator = Simulation_Orchestrator(engine, execution_mitigation=mitigation)
+    orchestrator._last_tick_panic_word_freq = Decimal("0")
+
+    orchestrator.submit_transaction(
+        "whale_1",
+        "SWAP",
+        {"pool_name": "Pool_A", "token_in": "UST", "amount": "100", "slippage_tolerance": "0.9"},
+        gas_price="900",
+    )
+
+    report = orchestrator.step_tick()
+    assert report.receipts[0].gas_bid == Decimal("900")
+    assert report.receipts[0].gas_effective == Decimal("50")

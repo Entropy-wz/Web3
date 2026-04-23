@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import logging
+import argparse
 from decimal import Decimal
 from pathlib import Path
 import sqlite3
@@ -193,7 +194,9 @@ def test_generate_social_eclipse_comparison_contains_asymmetry_fields(tmp_path: 
             "window_start_tick": 1,
             "window_end_tick": 5,
             "attacker_tx_success_rate_window": "0.20",
+            "attacker_tx_success_rate_executable_window": "0.25",
             "retail_tx_success_rate_window": "0.40",
+            "retail_tx_success_rate_executable_window": "0.55",
             "avg_gas_paid_attacker_window": "2",
             "avg_gas_paid_retail_window": "3",
             "max_gas_bid_in_window": "8",
@@ -208,12 +211,17 @@ def test_generate_social_eclipse_comparison_contains_asymmetry_fields(tmp_path: 
             "attacker_id": "whale_1",
             "triggered": True,
             "attacker_tx_success_rate_window": "1.0",
+            "attacker_tx_success_rate_executable_window": "1.0",
             "retail_tx_success_rate_window": "0.1",
+            "retail_tx_success_rate_executable_window": "0.95",
             "avg_gas_paid_attacker_window": "12",
             "avg_gas_paid_retail_window": "4",
             "max_gas_bid_in_window": "20",
             "max_gas_bid_attacker_in_window": "20",
             "max_gas_bid_retail_in_window": "11",
+            "attacker_capped_in_window": True,
+            "attacker_min_effective_gas_in_window": "50",
+            "attacker_first_cap_tick": 1,
         }
     }
     (baseline_dir / "summary.json").write_text(
@@ -243,8 +251,89 @@ def test_generate_social_eclipse_comparison_contains_asymmetry_fields(tmp_path: 
     metrics = payload["metrics"]
     assert "attacker_tx_success_rate_window" in metrics
     assert "retail_tx_success_rate_window" in metrics
+    assert "attacker_tx_success_rate_executable_window" in metrics
+    assert "retail_tx_success_rate_executable_window" in metrics
     assert "avg_gas_paid_attacker_window" in metrics
     assert "avg_gas_paid_retail_window" in metrics
     assert "max_gas_bid_in_window" in metrics
     assert "max_gas_bid_attacker_in_window" in metrics
     assert "max_gas_bid_retail_in_window" in metrics
+    assert "attacker_min_effective_gas_in_window" in metrics
+    assert "attacker_first_cap_tick" in metrics
+
+
+def test_write_run_window_metrics_csv_contains_dual_success_metrics(tmp_path: Path):
+    summary = {
+        "scenario": "staircase_formal_run",
+        "seed": 42,
+        "social_eclipse": {
+            "traffic_profile": "eval",
+            "window_start_tick": 1,
+            "window_end_tick": 5,
+            "attacker_id": "whale_1",
+            "attacker_tx_success_rate_window": "1.0",
+            "attacker_tx_success_rate_executable_window": "1.0",
+            "retail_tx_success_rate_window": "0.88",
+            "retail_tx_success_rate_executable_window": "0.99",
+            "attacker_vs_retail_success_rate_gap_window": "0.12",
+            "attacker_vs_retail_success_rate_gap_executable_window": "0.01",
+            "attacker_attempted_count_window": 10,
+            "attacker_settled_count_window": 10,
+            "attacker_failed_congestion_like_window": 0,
+            "attacker_executable_denominator_window": "10",
+            "retail_attempted_count_window": 500,
+            "retail_settled_count_window": 120,
+            "retail_failed_congestion_like_window": 380,
+            "retail_executable_denominator_window": "120",
+            "avg_gas_paid_attacker_window": "50",
+            "avg_gas_paid_retail_window": "9.5",
+            "max_gas_bid_in_window": "999",
+            "attacker_capped_in_window": True,
+            "attacker_capped_tx_count_window": 5,
+            "attacker_min_effective_gas_in_window": "50",
+            "attacker_first_cap_tick": 1,
+        },
+    }
+    output = VIS.write_run_window_metrics_csv(summary=summary, output_dir=tmp_path)
+    assert output.exists()
+    text = output.read_text(encoding="utf-8")
+    assert "retail_tx_success_rate_window" in text
+    assert "retail_tx_success_rate_executable_window" in text
+
+
+def test_parse_seed_list_supports_auto_and_deduplicate():
+    assert VIS._parse_seed_list("auto") == list(VIS.DEFAULT_PRETTY_SEEDS)
+    assert VIS._parse_seed_list("42,77,42,101") == [42, 77, 101]
+    assert VIS._parse_seed_list(None) == []
+
+
+def test_best_looking_preset_applies_expected_defaults():
+    args = argparse.Namespace(
+        best_looking_preset=True,
+        scenario="default",
+        ticks=40,
+        retail=12,
+        llm_agent_count=8,
+        pool_a_init="1000,1000",
+        retail_ust_cap="1000",
+        shock_t1="10",
+        shock_t3="5",
+        shock_t6="3",
+        voting_window_ticks=20,
+        max_inbox_size=3,
+        paper_chart_congestion_scale="linear",
+    )
+    report = VIS._apply_best_looking_preset(args)
+    assert report
+    assert args.scenario == VIS.SCENARIO_DEFAULT
+    assert args.ticks == 80
+    assert args.retail == 24
+    assert args.llm_agent_count == 27
+    assert args.pool_a_init == "10000000,10000000"
+    assert args.retail_ust_cap == "5000000"
+    assert args.shock_t1 == "1000000"
+    assert args.shock_t3 == "500000"
+    assert args.shock_t6 == "300000"
+    assert args.voting_window_ticks == 12
+    assert args.max_inbox_size == 5
+    assert args.paper_chart_congestion_scale == "log"

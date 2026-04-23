@@ -51,6 +51,7 @@ class ExecutionCircuitBreaker(BaseExecutionMitigation):
         gas_weight: Decimal | str = Decimal("0.2"),
         age_weight: Decimal | str = Decimal("0.8"),
         age_norm_ticks: int = 100,
+        warm_start_ticks: int = 0,
         role_bias: dict[str, Decimal] | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
@@ -59,12 +60,15 @@ class ExecutionCircuitBreaker(BaseExecutionMitigation):
         self.gas_weight = Decimal(str(gas_weight))
         self.age_weight = Decimal(str(age_weight))
         self.age_norm_ticks = int(age_norm_ticks)
+        self.warm_start_ticks = int(warm_start_ticks)
         if self.panic_threshold < 0:
             raise ValueError("panic_threshold must be >= 0")
         if self.crisis_gas_cap <= 0:
             raise ValueError("crisis_gas_cap must be > 0")
         if self.age_norm_ticks <= 0:
             raise ValueError("age_norm_ticks must be > 0")
+        if self.warm_start_ticks < 0:
+            raise ValueError("warm_start_ticks must be >= 0")
         if self.gas_weight < 0 or self.age_weight < 0:
             raise ValueError("gas_weight and age_weight must be >= 0")
         if (self.gas_weight + self.age_weight) <= 0:
@@ -99,39 +103,56 @@ class ExecutionCircuitBreaker(BaseExecutionMitigation):
             Decimal(str(last_tick_panic_word_freq)),
             Decimal(str(current_semantic_panic_word_freq)),
         )
-        crisis_mode = panic_signal > self.panic_threshold
+        warm_start_active = int(current_tick) <= self.warm_start_ticks
+        crisis_mode = (panic_signal > self.panic_threshold) or warm_start_active
         capped_count = 0
 
         if crisis_mode:
+            reason = (
+                "warm-start"
+                if warm_start_active and panic_signal <= self.panic_threshold
+                else "panic"
+            )
             self._logger.info(
                 "[MITIGATION-B-ACTIVATE] Social Panic Detected! Switching to Fair-Weight Sorting. "
-                "tick=%d panic_signal=%s threshold=%s",
+                "tick=%d panic_signal=%s threshold=%s reason=%s",
                 int(current_tick),
                 str(panic_signal),
                 str(self.panic_threshold),
+                reason,
             )
 
+        # IMPORTANT: mutate tx objects in-place so downstream fee/DB flow reads effective_gas_price.
         for tx in transactions:
             raw_gas = Decimal(str(getattr(tx, "raw_gas_price", getattr(tx, "gas_price", "0"))))
             tx.raw_gas_price = raw_gas
             tx.mitigation_flags = list(getattr(tx, "mitigation_flags", []))
+            current_effective = Decimal(
+                str(getattr(tx, "effective_gas_price", raw_gas))
+            )
 
             if not crisis_mode:
-                tx.effective_gas_price = raw_gas
+                # Preserve prior capped state; do not restore to raw gas automatically.
+                if current_effective > raw_gas:
+                    current_effective = raw_gas
+                tx.effective_gas_price = current_effective
+                if tx.effective_gas_price < raw_gas:
+                    capped_count += 1
                 continue
 
-            effective = min(raw_gas, self.crisis_gas_cap)
+            effective = min(raw_gas, self.crisis_gas_cap, current_effective)
             tx.effective_gas_price = effective
             if effective < raw_gas:
                 capped_count += 1
                 if "gas_capped" not in tx.mitigation_flags:
                     tx.mitigation_flags.append("gas_capped")
-                self._logger.info(
-                    "[GAS-CAPPED] tx_id=%s original_gas=%s capped_to=%s",
-                    str(getattr(tx, "tx_id", "")),
-                    str(raw_gas),
-                    str(self.crisis_gas_cap),
-                )
+                if effective < current_effective:
+                    self._logger.info(
+                        "[GAS-CAPPED] tx_id=%s original_gas=%s capped_to=%s",
+                        str(getattr(tx, "tx_id", "")),
+                        str(raw_gas),
+                        str(self.crisis_gas_cap),
+                    )
 
         if not crisis_mode:
             ordered = sorted(
@@ -145,7 +166,7 @@ class ExecutionCircuitBreaker(BaseExecutionMitigation):
                 ordered_transactions=ordered,
                 crisis_mode=False,
                 panic_signal=panic_signal,
-                capped_count=0,
+                capped_count=capped_count,
             )
 
         def _score(tx: Any) -> Decimal:
